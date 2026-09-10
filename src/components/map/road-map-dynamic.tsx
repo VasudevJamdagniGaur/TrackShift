@@ -22,6 +22,7 @@ export function RoadMapDynamic(props: {
   focus?: [number, number] | null;
   className?: string;
   onSelectIssue?: (issue: RoadIssue) => void;
+  showMapillary?: boolean;
 }) {
   return <RoadMapInner {...props} />;
 }

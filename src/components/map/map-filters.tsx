@@ -13,6 +13,8 @@ export function MapFiltersBar({
   onQueryChange,
   onTypeChange,
   onSeverityChange,
+  showMapillary,
+  onShowMapillaryChange,
 }: {
   query: string;
   type: IssueType | "all";
@@ -20,6 +22,8 @@ export function MapFiltersBar({
   onQueryChange: (value: string) => void;
   onTypeChange: (value: IssueType | "all") => void;
   onSeverityChange: (value: Severity | "all") => void;
+  showMapillary?: boolean;
+  onShowMapillaryChange?: (value: boolean) => void;
 }) {
   return (
     <div className="space-y-3">
@@ -49,6 +53,17 @@ export function MapFiltersBar({
           className="h-11 rounded-xl border border-[var(--border-strong)] bg-cream/80 px-3 text-sm outline-none focus:ring-2 focus:ring-[var(--ring)]"
           aria-label="Date range start"
         />
+        {onShowMapillaryChange != null && (
+          <label className="inline-flex h-11 cursor-pointer items-center gap-2 rounded-xl border border-[var(--border-strong)] bg-cream/80 px-3 text-xs font-medium text-charcoal">
+            <input
+              type="checkbox"
+              checked={!!showMapillary}
+              onChange={(e) => onShowMapillaryChange(e.target.checked)}
+              className="h-4 w-4 accent-[var(--forest)]"
+            />
+            Mapillary photos
+          </label>
+        )}
         <div className="inline-flex items-center gap-2 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs font-medium text-emerald-800">
           <span className="live-pulse h-2 w-2 rounded-full bg-emerald-500" />
           Live Monitoring

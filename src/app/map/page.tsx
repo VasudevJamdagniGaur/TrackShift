@@ -20,6 +20,7 @@ export default function MapPage() {
   const [query, setQuery] = useState("");
   const [type, setType] = useState<IssueType | "all">("all");
   const [severity, setSeverity] = useState<Severity | "all">("all");
+  const [showMapillary, setShowMapillary] = useState(true);
 
   const issues = useMemo(
     () => filterIssues({ query, type, severity }),
@@ -52,6 +53,8 @@ export default function MapPage() {
             onQueryChange={setQuery}
             onTypeChange={setType}
             onSeverityChange={setSeverity}
+            showMapillary={showMapillary}
+            onShowMapillaryChange={setShowMapillary}
           />
         </div>
 
@@ -60,12 +63,13 @@ export default function MapPage() {
             <div className="flex items-center justify-between border-b border-[var(--border)] px-4 py-3 text-sm">
               <span className="text-muted">
                 Showing {issues.length} issues · Demo markers
+                {showMapillary ? " · Mapillary check on" : ""}
               </span>
               <div className="hidden items-center gap-3 text-xs text-muted sm:flex">
                 <span>🔴 Severe</span>
                 <span>🟠 Moderate</span>
                 <span>🟡 Minor</span>
-                <span>🔵 Other</span>
+                <span className="text-emerald-700">🟢 Mapillary</span>
               </div>
             </div>
             <div className="h-[560px]">
@@ -73,6 +77,7 @@ export default function MapPage() {
                 issues={issues}
                 segments={roadSegments}
                 focus={focus}
+                showMapillary={showMapillary}
                 className="h-full w-full rounded-none"
               />
             </div>
