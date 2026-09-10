@@ -1,0 +1,190 @@
+@import "tailwindcss";
+@import "leaflet/dist/leaflet.css";
+
+:root {
+  --ivory: #f7f4ef;
+  --ivory-deep: #efe9df;
+  --beige: #e8e0d4;
+  --beige-soft: #f0eae0;
+  --forest: #1b3a2f;
+  --forest-mid: #234d3c;
+  --forest-soft: #2f5d49;
+  --charcoal: #2c2c2a;
+  --charcoal-soft: #3f3f3b;
+  --gold: #b8975a;
+  --gold-soft: #c4a574;
+  --gold-muted: #d6c4a0;
+  --cream: #faf8f5;
+  --border: rgba(44, 44, 42, 0.08);
+  --border-strong: rgba(44, 44, 42, 0.14);
+  --shadow: 0 10px 30px rgba(27, 58, 47, 0.06);
+  --shadow-soft: 0 4px 16px rgba(44, 44, 42, 0.05);
+  --background: var(--ivory);
+  --foreground: var(--charcoal);
+  --card: #fffcf8;
+  --muted: #6b6760;
+  --ring: rgba(184, 151, 90, 0.45);
+  --success: #2f6b4f;
+  --warning: #c07a2c;
+  --danger: #b42318;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-ivory: var(--ivory);
+  --color-ivory-deep: var(--ivory-deep);
+  --color-beige: var(--beige);
+  --color-beige-soft: var(--beige-soft);
+  --color-forest: var(--forest);
+  --color-forest-mid: var(--forest-mid);
+  --color-forest-soft: var(--forest-soft);
+  --color-charcoal: var(--charcoal);
+  --color-charcoal-soft: var(--charcoal-soft);
+  --color-gold: var(--gold);
+  --color-gold-soft: var(--gold-soft);
+  --color-gold-muted: var(--gold-muted);
+  --color-cream: var(--cream);
+  --color-card: var(--card);
+  --color-muted: var(--muted);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+  --font-sans: var(--font-plus-jakarta);
+  --font-serif: var(--font-cormorant);
+  --radius-card: 1.25rem;
+  --radius-lg: 1rem;
+  --radius-md: 0.75rem;
+}
+
+* {
+  border-color: var(--border);
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background:
+    radial-gradient(ellipse 80% 50% at 10% -10%, rgba(184, 151, 90, 0.08), transparent 55%),
+    radial-gradient(ellipse 60% 40% at 100% 0%, rgba(27, 58, 47, 0.06), transparent 50%),
+    var(--ivory);
+  color: var(--charcoal);
+  font-family: var(--font-plus-jakarta), ui-sans-serif, system-ui, sans-serif;
+  text-rendering: optimizeLegibility;
+}
+
+h1,
+h2,
+h3,
+.font-serif {
+  font-family: var(--font-cormorant), ui-serif, Georgia, serif;
+  letter-spacing: -0.02em;
+}
+
+::selection {
+  background: rgba(184, 151, 90, 0.28);
+}
+
+.card-surface {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 1.25rem;
+  box-shadow: var(--shadow-soft);
+}
+
+.leaflet-container {
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  font-family: inherit;
+  background: #e8e0d4;
+  z-index: 0;
+}
+
+.leaflet-popup-content-wrapper {
+  border-radius: 16px !important;
+  box-shadow: var(--shadow) !important;
+  border: 1px solid var(--border-strong);
+  padding: 0;
+}
+
+.leaflet-popup-content {
+  margin: 0 !important;
+  min-width: 220px;
+}
+
+.leaflet-popup-tip {
+  box-shadow: none !important;
+}
+
+.severity-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  border: 2px solid white;
+  box-shadow: 0 0 0 2px rgba(44, 44, 42, 0.15);
+}
+
+@keyframes pulse-live {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.55;
+    transform: scale(0.92);
+  }
+}
+
+.live-pulse {
+  animation: pulse-live 1.6s ease-in-out infinite;
+}
+
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    rgba(232, 224, 212, 0.55),
+    rgba(250, 248, 245, 0.9),
+    rgba(232, 224, 212, 0.55)
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.4s ease-in-out infinite;
+  border-radius: 12px;
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+.page-enter {
+  animation: fade-up 0.45s ease both;
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.scrollbar-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: rgba(27, 58, 47, 0.2);
+  border-radius: 999px;
+}
