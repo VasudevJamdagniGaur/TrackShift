@@ -1,10 +1,8 @@
 "use client";
 
-import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertCircle,
-  Download,
   Loader2,
   ShieldAlert,
   Upload,
@@ -12,12 +10,13 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import {
+  ForensicResultView,
+  type ForensicJob,
+  type ForensicViolation,
+} from "@/components/cctv/forensic-result-view";
 
-type Job = {
-  jobId: string;
-  videoId: string;
-  status: string;
-  fileName?: string;
+type Job = ForensicJob & {
   totalFrames?: number;
   processedFrames?: number;
   progressPercentage?: number;
@@ -40,36 +39,10 @@ type Job = {
     totalSeconds?: number;
     stages?: Record<string, { seconds?: number; calls?: number; avgMs?: number }>;
   };
-  metadata?: {
-    fps?: number;
-    durationSeconds?: number;
-    frameCount?: number;
-  };
-  summary?: {
-    framesAnalyzed?: number;
-    motorcycles?: number;
-    noHelmetCandidates?: number;
-    confirmedViolations?: number;
-    licensePlatesRecognized?: number;
-    platesDetected?: number;
-    annotatedVideoPath?: string | null;
-    processingSeconds?: number;
-    processingFps?: number;
+  summary?: ForensicJob["summary"] & {
     imgsz?: number;
     detectionInterval?: number;
   };
-};
-
-type Violation = {
-  violationId: string;
-  timestamp: number;
-  trackId: number;
-  violationType: string;
-  noHelmetConfidence: number;
-  plateText?: string | null;
-  plateConfidence?: number;
-  status: string;
-  annotatedEvidencePath?: string;
 };
 
 type Stats = {
@@ -82,13 +55,9 @@ type Stats = {
   processingJobs: number;
 };
 
-const ACCEPT = "video/mp4,video/webm,video/quicktime,video/x-msvideo,.mp4,.webm,.mov,.avi,.mkv,.m4v";
-
-function formatTs(seconds: number) {
-  const m = Math.floor(seconds / 60);
-  const s = seconds - m * 60;
-  return `${String(m).padStart(2, "0")}:${s.toFixed(2).padStart(5, "0")}`;
-}
+const ACCEPT =
+  "video/mp4,video/webm,video/quicktime,video/x-msvideo,.mp4,.webm,.mov,.avi,.mkv,.m4v";
+const LAST_JOB_KEY = "cctv:lastJobId";
 
 export function ForensicUpload() {
   const inputRef = useRef<HTMLInputElement>(null);
@@ -97,7 +66,7 @@ export function ForensicUpload() {
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [job, setJob] = useState<Job | null>(null);
-  const [violations, setViolations] = useState<Violation[]>([]);
+  const [violations, setViolations] = useState<ForensicViolation[]>([]);
   const [stats, setStats] = useState<Stats | null>(null);
 
   const refreshStats = useCallback(async () => {
@@ -116,12 +85,34 @@ export function ForensicUpload() {
     setViolations(json.violations || []);
   }, []);
 
+  const loadJob = useCallback(
+    async (jobId: string) => {
+      const res = await fetch(`/api/cctv/jobs/${jobId}`);
+      if (!res.ok) return null;
+      const next = (await res.json()) as Job;
+      setJob(next);
+      if (next.status === "COMPLETED" && next.videoId) {
+        await loadViolations(next.videoId);
+      }
+      return next;
+    },
+    [loadViolations]
+  );
+
   useEffect(() => {
     void refreshStats();
-  }, [refreshStats]);
+    const saved =
+      typeof window !== "undefined"
+        ? window.localStorage.getItem(LAST_JOB_KEY)
+        : null;
+    if (saved) {
+      void loadJob(saved);
+    }
+  }, [refreshStats, loadJob]);
 
   useEffect(() => {
     if (!job?.jobId) return;
+    window.localStorage.setItem(LAST_JOB_KEY, job.jobId);
     if (job.status === "COMPLETED" || job.status === "FAILED") return;
 
     const timer = window.setInterval(async () => {
@@ -176,6 +167,7 @@ export function ForensicUpload() {
           json.error || "Maximum supported video duration is 5 minutes."
         );
       }
+      window.localStorage.setItem(LAST_JOB_KEY, json.jobId);
       const jobRes = await fetch(`/api/cctv/jobs/${json.jobId}`);
       const jobJson = (await jobRes.json()) as Job;
       setJob(jobJson);
@@ -192,6 +184,7 @@ export function ForensicUpload() {
     setJob(null);
     setViolations([]);
     setError(null);
+    window.localStorage.removeItem(LAST_JOB_KEY);
     if (inputRef.current) inputRef.current.value = "";
   };
 
@@ -239,78 +232,82 @@ export function ForensicUpload() {
       )}
 
       <div className="space-y-4 p-5 md:p-6">
-        <div
-          role="button"
-          tabIndex={0}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" || e.key === " ") inputRef.current?.click();
-          }}
-          onDragOver={(e) => {
-            e.preventDefault();
-            setDragOver(true);
-          }}
-          onDragLeave={() => setDragOver(false)}
-          onDrop={(e) => {
-            e.preventDefault();
-            setDragOver(false);
-            onPick(e.dataTransfer.files?.[0] ?? null);
-          }}
-          onClick={() => inputRef.current?.click()}
-          className={cn(
-            "flex min-h-[140px] cursor-pointer flex-col items-center justify-center gap-3 rounded-2xl border border-dashed px-4 py-8 text-center transition",
-            dragOver
-              ? "border-forest bg-beige-soft/80"
-              : "border-[var(--border-strong)] bg-beige-soft/40 hover:border-forest/40"
-          )}
-        >
-          <div className="flex h-12 w-12 items-center justify-center rounded-2xl border border-[var(--border)] bg-cream">
-            <Upload className="h-5 w-5 text-forest" />
-          </div>
-          <div>
-            <div className="text-sm font-medium">Drag & drop CCTV video</div>
-            <div className="mt-1 text-xs text-muted">
-              MP4 / AVI / MOV / MKV / WEBM · max 5 minutes · max 1024 MB
-            </div>
-          </div>
-          <input
-            ref={inputRef}
-            type="file"
-            accept={ACCEPT}
-            className="hidden"
-            onChange={(e) => onPick(e.target.files?.[0] ?? null)}
-          />
-        </div>
-
-        {file && (
-          <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[var(--border)] bg-white/50 px-4 py-3">
-            <div className="min-w-0">
-              <div className="truncate text-sm font-medium">{file.name}</div>
-              <div className="text-xs text-muted">
-                {(file.size / (1024 * 1024)).toFixed(1)} MB
+        {job?.status !== "COMPLETED" && (
+          <>
+            <div
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") inputRef.current?.click();
+              }}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDragOver(true);
+              }}
+              onDragLeave={() => setDragOver(false)}
+              onDrop={(e) => {
+                e.preventDefault();
+                setDragOver(false);
+                onPick(e.dataTransfer.files?.[0] ?? null);
+              }}
+              onClick={() => inputRef.current?.click()}
+              className={cn(
+                "flex min-h-[140px] cursor-pointer flex-col items-center justify-center gap-3 rounded-2xl border border-dashed px-4 py-8 text-center transition",
+                dragOver
+                  ? "border-forest bg-beige-soft/80"
+                  : "border-[var(--border-strong)] bg-beige-soft/40 hover:border-forest/40"
+              )}
+            >
+              <div className="flex h-12 w-12 items-center justify-center rounded-2xl border border-[var(--border)] bg-cream">
+                <Upload className="h-5 w-5 text-forest" />
               </div>
+              <div>
+                <div className="text-sm font-medium">Drag & drop CCTV video</div>
+                <div className="mt-1 text-xs text-muted">
+                  MP4 / AVI / MOV / MKV / WEBM · max 5 minutes · max 1024 MB
+                </div>
+              </div>
+              <input
+                ref={inputRef}
+                type="file"
+                accept={ACCEPT}
+                className="hidden"
+                onChange={(e) => onPick(e.target.files?.[0] ?? null)}
+              />
             </div>
-            <div className="flex gap-2">
-              <Button type="button" variant="ghost" size="sm" onClick={clear}>
-                <X className="h-4 w-4" />
-                Clear
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                onClick={startAnalysis}
-                disabled={uploading || !!processing}
-              >
-                {uploading ? (
-                  <>
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                    Uploading…
-                  </>
-                ) : (
-                  "Start forensic analysis"
-                )}
-              </Button>
-            </div>
-          </div>
+
+            {file && (
+              <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[var(--border)] bg-white/50 px-4 py-3">
+                <div className="min-w-0">
+                  <div className="truncate text-sm font-medium">{file.name}</div>
+                  <div className="text-xs text-muted">
+                    {(file.size / (1024 * 1024)).toFixed(1)} MB
+                  </div>
+                </div>
+                <div className="flex gap-2">
+                  <Button type="button" variant="ghost" size="sm" onClick={clear}>
+                    <X className="h-4 w-4" />
+                    Clear
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    onClick={startAnalysis}
+                    disabled={uploading || !!processing}
+                  >
+                    {uploading ? (
+                      <>
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        Uploading…
+                      </>
+                    ) : (
+                      "Start forensic analysis"
+                    )}
+                  </Button>
+                </div>
+              </div>
+            )}
+          </>
         )}
 
         {error && (
@@ -320,15 +317,13 @@ export function ForensicUpload() {
           </div>
         )}
 
-        {job && (
+        {job && job.status !== "COMPLETED" && (
           <div className="rounded-2xl border border-[var(--border)] bg-beige-soft/30 p-4">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="font-serif text-xl">
-                {job.status === "COMPLETED"
-                  ? "PROCESSING COMPLETE"
-                  : job.status === "FAILED"
-                    ? "Processing failed"
-                    : "Processing video…"}
+                {job.status === "FAILED"
+                  ? "Processing failed"
+                  : "Processing video…"}
               </div>
               <span className="rounded-full border border-[var(--border)] bg-cream px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide">
                 {job.status}
@@ -398,94 +393,38 @@ export function ForensicUpload() {
             {job.error && (
               <p className="mt-3 text-sm text-red-700">{job.error}</p>
             )}
-
-            {job.status === "COMPLETED" && job.summary && (
-              <div className="mt-4 rounded-xl border border-[var(--border)] bg-cream p-3 text-sm">
-                <div>Frames analyzed: {job.summary.framesAnalyzed}</div>
-                <div>Motorcycles: {job.summary.motorcycles}</div>
-                <div>No-helmet candidates: {job.summary.noHelmetCandidates}</div>
-                <div>Confirmed violations: {job.summary.confirmedViolations}</div>
-                <div>
-                  License plates recognized:{" "}
-                  {job.summary.licensePlatesRecognized}
-                </div>
-                <div className="mt-3 flex flex-wrap gap-2">
-                  <Button asChild size="sm" variant="soft">
-                    <a href={`/api/cctv/export?format=csv&videoId=${job.videoId}`}>
-                      <Download className="h-4 w-4" />
-                      Export CSV
-                    </a>
-                  </Button>
-                  <Button asChild size="sm" variant="ghost">
-                    <a href={`/api/cctv/export?format=json&videoId=${job.videoId}`}>
-                      Export JSON
-                    </a>
-                  </Button>
-                  {job.summary.annotatedVideoPath && (
-                    <Button asChild size="sm" variant="ghost">
-                      <a href={job.summary.annotatedVideoPath} target="_blank">
-                        Annotated MP4
-                      </a>
-                    </Button>
-                  )}
-                </div>
-              </div>
-            )}
           </div>
         )}
 
-        {violations.length > 0 && (
-          <div className="overflow-hidden rounded-2xl border border-[var(--border)]">
-            <div className="border-b border-[var(--border)] bg-beige-soft/40 px-4 py-3 font-serif text-xl">
-              Violation cases
+        {job?.status === "COMPLETED" && (
+          <div className="space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="text-sm text-muted">
+                Job <span className="font-mono">{job.jobId}</span> completed
+                {job.summary?.processingSeconds != null
+                  ? ` · ${job.summary.processingSeconds.toFixed(1)}s analysis`
+                  : ""}
+              </div>
+              <div className="flex gap-2">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => void loadJob(job.jobId)}
+                >
+                  Refresh result
+                </Button>
+                <Button type="button" size="sm" variant="ghost" onClick={clear}>
+                  Analyze another video
+                </Button>
+              </div>
             </div>
-            <div className="overflow-x-auto">
-              <table className="min-w-full text-left text-sm">
-                <thead className="bg-cream text-xs uppercase tracking-wide text-muted">
-                  <tr>
-                    <th className="px-3 py-2">Timestamp</th>
-                    <th className="px-3 py-2">Vehicle</th>
-                    <th className="px-3 py-2">Violation</th>
-                    <th className="px-3 py-2">Confidence</th>
-                    <th className="px-3 py-2">Plate</th>
-                    <th className="px-3 py-2">Plate conf</th>
-                    <th className="px-3 py-2">Status</th>
-                    <th className="px-3 py-2">Evidence</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {violations.map((v) => (
-                    <tr key={v.violationId} className="border-t border-[var(--border)]">
-                      <td className="px-3 py-2 font-mono text-xs">
-                        {formatTs(v.timestamp)}
-                      </td>
-                      <td className="px-3 py-2">Track #{v.trackId}</td>
-                      <td className="px-3 py-2">{v.violationType}</td>
-                      <td className="px-3 py-2">
-                        {Math.round((v.noHelmetConfidence || 0) * 100)}%
-                      </td>
-                      <td className="px-3 py-2 font-mono text-xs">
-                        {v.plateText || "—"}
-                      </td>
-                      <td className="px-3 py-2">
-                        {v.plateText
-                          ? `${Math.round((v.plateConfidence || 0) * 100)}%`
-                          : "—"}
-                      </td>
-                      <td className="px-3 py-2">{v.status}</td>
-                      <td className="px-3 py-2">
-                        <Link
-                          href={`/violations/${v.violationId}`}
-                          className="font-medium text-forest underline-offset-2 hover:underline"
-                        >
-                          View
-                        </Link>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+            <ForensicResultView
+              key={`${job.jobId}-${job.updatedAt || job.annotatedVideoPath || "v"}`}
+              job={job}
+              violations={violations}
+              onViolationsChange={setViolations}
+            />
           </div>
         )}
       </div>

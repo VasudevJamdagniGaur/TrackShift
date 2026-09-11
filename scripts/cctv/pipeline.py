@@ -19,6 +19,7 @@ Architecture speedups (no resolution reduction):
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from collections import defaultdict
@@ -32,13 +33,16 @@ import numpy as np
 
 from .config import CONFIG, CctvConfig
 from .model_manager import ModelManager, gpu_info
+from .render_video import build_track_display, render_annotated_video
 from .store import CctvStore
 from .utils import (
     box_center,
+    build_head_crop_variants,
     clamp_box,
     enhance_frame,
     head_crop_from_keypoints,
     iou,
+    moto_proxy_person_box,
     quality_score,
     validate_indian_plate,
     weighted_ocr_vote,
@@ -123,26 +127,67 @@ def reject_if_too_long(meta: dict, config: CctvConfig) -> None:
         raise ValueError("Maximum supported video duration is 5 minutes.")
 
 
-def associate_driver(moto_box, people: list[dict]):
+def associate_driver(moto_box, people: list[dict], expand: float = 0.30):
+    """
+    Prefer people overlapping / contained in an expanded motorcycle region.
+    Avoid latching onto tiny edge fragments far from the moto interior.
+    """
     if not people:
         return None
+    mx1, my1, mx2, my2 = moto_box
+    mw, mh = max(1.0, mx2 - mx1), max(1.0, my2 - my1)
     mx, my = box_center(moto_box)
-    mh = max(1.0, moto_box[3] - moto_box[1])
-    best = None
-    best_d = 1e18
+    expanded = [
+        mx1 - expand * mw,
+        my1 - expand * mh,
+        mx2 + expand * mw,
+        my2 + 0.15 * mh,
+    ]
+    moto_area = mw * mh
+    scored: list[tuple[float, dict]] = []
     for person in people:
-        px, py = box_center(person["box"])
-        if py > my + mh * 0.45:
-            continue
-        d = (px - mx) ** 2 + (py - my) ** 2
-        if d < best_d:
-            best_d = d
-            best = person
-    return best or min(
-        people,
-        key=lambda p: (box_center(p["box"])[0] - mx) ** 2
-        + (box_center(p["box"])[1] - my) ** 2,
-    )
+        pb = person["box"]
+        px, py = box_center(pb)
+        pw, ph = max(1.0, pb[2] - pb[0]), max(1.0, pb[3] - pb[1])
+        area_ratio = (pw * ph) / max(1.0, moto_area)
+        overlap = iou(pb, expanded)
+        center_in = (
+            expanded[0] <= px <= expanded[2] and expanded[1] <= py <= expanded[3]
+        )
+        dist = (((px - mx) ** 2 + (py - my) ** 2) ** 0.5) / max(mw, mh)
+        score = (
+            3.0 * overlap
+            + (1.2 if center_in else 0.0)
+            + 0.35 * float(person.get("confidence") or 0.0)
+            - 0.55 * dist
+        )
+        # Tiny fragments relative to moto are usually wrong associations
+        if area_ratio < 0.03:
+            score *= 0.25
+        if area_ratio < 0.08 and overlap < 0.05:
+            score *= 0.4
+        # Person mostly below moto center is less likely the rider
+        if py > my + mh * 0.55:
+            score *= 0.25
+        scored.append((score, person))
+    scored.sort(key=lambda x: -x[0])
+    if not scored:
+        return None
+    best_score, best_person = scored[0]
+    pb = best_person["box"]
+    pw, ph = max(1.0, pb[2] - pb[0]), max(1.0, pb[3] - pb[1])
+    area_ratio = (pw * ph) / max(1.0, moto_area)
+    # Reject weak / fragment associations so moto-proxy rider can activate
+    if best_score < 0.35 or area_ratio < 0.05:
+        return None
+    return best_person
+
+
+def soft_helmet_label(helmet_p: float, no_helmet_p: float, config: CctvConfig) -> str:
+    """Recall-first soft label: candidate threshold beats pure argmax."""
+    if no_helmet_p >= config.no_helmet_candidate_prob:
+        return "no_helmet"
+    return "no_helmet" if no_helmet_p >= helmet_p else "helmet"
 
 
 def temporal_decision(track: TrackState, config: CctvConfig) -> dict[str, Any]:
@@ -154,11 +199,23 @@ def temporal_decision(track: TrackState, config: CctvConfig) -> dict[str, Any]:
     no_helmet = [p for p in preds if p["prediction"] == "no_helmet"]
     votes = len(no_helmet)
     ratio = votes / n
-    avg_conf = float(np.mean([p["noHelmetProbability"] for p in no_helmet])) if no_helmet else 0.0
+    avg_conf = (
+        float(np.mean([p["noHelmetProbability"] for p in no_helmet])) if no_helmet else 0.0
+    )
+    # Also consider soft average across ALL frames (helps borderline ensembles)
+    avg_nh_all = float(np.mean([p["noHelmetProbability"] for p in preds])) if preds else 0.0
     helmet_votes = [p for p in preds if p["prediction"] == "helmet"]
     helmet_ratio = len(helmet_votes) / n
     avg_helmet = (
         float(np.mean([p["helmetProbability"] for p in helmet_votes])) if helmet_votes else 0.0
+    )
+    strong_frames = sum(
+        1
+        for p in no_helmet
+        if p["noHelmetProbability"] >= config.no_helmet_strong_prob
+    )
+    high_frames = sum(
+        1 for p in no_helmet if p["noHelmetProbability"] >= config.no_helmet_high_prob
     )
 
     stats = {
@@ -166,27 +223,42 @@ def temporal_decision(track: TrackState, config: CctvConfig) -> dict[str, Any]:
         "noHelmetVotes": votes,
         "noHelmetRatio": round(ratio, 4),
         "avgNoHelmetConfidence": round(avg_conf, 4),
+        "avgNoHelmetAllFrames": round(avg_nh_all, 4),
         "helmetRatio": round(helmet_ratio, 4),
         "avgHelmetConfidence": round(avg_helmet, 4),
+        "strongNoHelmetFrames": strong_frames,
+        "highNoHelmetFrames": high_frames,
     }
 
-    if helmet_ratio >= 0.7 and avg_helmet >= 0.75 and ratio < 0.4:
+    if helmet_ratio >= 0.75 and avg_helmet >= 0.78 and ratio < 0.35:
         return {"state": "NORMAL", "reason": "helmet_majority", **stats}
 
-    strong = (
+    confirmed = (
         votes >= config.min_no_helmet_votes
         and ratio >= config.min_no_helmet_ratio
         and avg_conf >= config.min_avg_no_helmet_confidence
+    ) or (
+        high_frames >= 2
+        and votes >= config.min_no_helmet_votes
+        and avg_conf >= max(0.55, config.min_avg_no_helmet_confidence - 0.05)
     )
-    if strong:
+    if confirmed:
         return {"state": "CONFIRMED", "reason": "temporal_vote_pass", **stats}
 
-    weak = votes >= 2 and ratio >= 0.4 and avg_conf >= 0.65
-    if weak:
-        return {"state": "POTENTIAL", "reason": "weak_evidence", **stats}
+    potential = (
+        votes >= config.candidate_min_votes
+        and ratio >= config.candidate_min_ratio
+        and (avg_conf >= config.candidate_min_avg_conf or avg_nh_all >= config.candidate_min_avg_conf)
+    ) or (
+        strong_frames >= 2
+        and votes >= 2
+        and avg_nh_all >= 0.42
+    )
+    if potential:
+        return {"state": "POTENTIAL", "reason": "candidate_evidence", **stats}
 
-    if votes >= 2 and avg_conf >= 0.55:
-        return {"state": "NEEDS_REVIEW", "reason": "contradictory_or_weak", **stats}
+    if votes >= 2 and (avg_conf >= 0.40 or avg_nh_all >= 0.42):
+        return {"state": "NEEDS_REVIEW", "reason": "borderline_evidence", **stats}
 
     return {"state": "NORMAL", "reason": "below_threshold", **stats}
 
@@ -351,6 +423,8 @@ class ForensicPipeline:
                 progressPercentage=100,
                 processedFrames=meta["frameCount"],
                 etaSeconds=0,
+                annotatedVideoPath=result.get("annotatedVideoPath"),
+                annotatedVideoUrl=result.get("annotatedVideoUrl"),
                 **result["jobStats"],
                 summary=result["summary"],
                 profiling=result["profiling"],
@@ -380,22 +454,16 @@ class ForensicPipeline:
         out_dir = self.config.public_dir / video_id
         evidence_dir = out_dir / "evidence"
         evidence_dir.mkdir(parents=True, exist_ok=True)
+        job_dir = self.config.data_dir / "jobs" / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        timeline_path = job_dir / "timeline.jsonl"
 
         fps = float(meta["fps"])
         total = int(meta["frameCount"])
         profiler = Profiler()
 
-        writer = None
-        annotated_path = None
-        if self.config.enable_output_video:
-            annotated_path = out_dir / "annotated.mp4"
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(
-                str(annotated_path),
-                fourcc,
-                fps,
-                (int(meta["width"]), int(meta["height"])),
-            )
+        # Annotated video is rendered AFTER analysis from timeline (no second ML pass)
+        timeline_f = open(timeline_path, "w", encoding="utf-8")
 
         frame_q, decoder_thread, decoder_meta = _start_decoder(
             video_path, self.config.frame_queue_size
@@ -408,6 +476,79 @@ class ForensicPipeline:
         last_people: list[dict] = []
         last_bikes: list[dict] = []
         t_wall0 = time.perf_counter()
+
+        try:
+            return self._analyze_and_finalize(
+                job_id=job_id,
+                video_id=video_id,
+                video_path=video_path,
+                meta=meta,
+                out_dir=out_dir,
+                evidence_dir=evidence_dir,
+                job_dir=job_dir,
+                timeline_path=timeline_path,
+                timeline_f=timeline_f,
+                frame_q=frame_q,
+                decoder_meta=decoder_meta,
+                det=det,
+                helmet=helmet,
+                pose=pose,
+                plate_det=plate_det,
+                ocr=ocr,
+                yolo_kw=yolo_kw,
+                imgsz=imgsz,
+                det_interval=det_interval,
+                pose_interval=pose_interval,
+                fps=fps,
+                total=total,
+                profiler=profiler,
+                tracks=tracks,
+                moto_ids=moto_ids,
+                frame_idx=frame_idx,
+                last_progress=last_progress,
+                last_people=last_people,
+                last_bikes=last_bikes,
+                t_wall0=t_wall0,
+            )
+        finally:
+            try:
+                timeline_f.close()
+            except Exception:
+                pass
+            decoder_meta["stopped"] = True
+
+    def _analyze_and_finalize(self, **ctx) -> dict:
+        """Frame loop + plate OCR + annotated video render (no second ML pass for overlays)."""
+        job_id = ctx["job_id"]
+        video_id = ctx["video_id"]
+        video_path = ctx["video_path"]
+        meta = ctx["meta"]
+        evidence_dir = ctx["evidence_dir"]
+        job_dir = ctx["job_dir"]
+        timeline_path = ctx["timeline_path"]
+        timeline_f = ctx["timeline_f"]
+        frame_q = ctx["frame_q"]
+        decoder_meta = ctx["decoder_meta"]
+        det = ctx["det"]
+        helmet = ctx["helmet"]
+        pose = ctx["pose"]
+        plate_det = ctx["plate_det"]
+        ocr = ctx["ocr"]
+        yolo_kw = ctx["yolo_kw"]
+        imgsz = ctx["imgsz"]
+        det_interval = ctx["det_interval"]
+        pose_interval = ctx["pose_interval"]
+        fps = ctx["fps"]
+        total = ctx["total"]
+        profiler = ctx["profiler"]
+        tracks = ctx["tracks"]
+        moto_ids = ctx["moto_ids"]
+        frame_idx = ctx["frame_idx"]
+        last_progress = ctx["last_progress"]
+        last_people = ctx["last_people"]
+        last_bikes = ctx["last_bikes"]
+        t_wall0 = ctx["t_wall0"]
+        debug_logs: list[dict] = []
 
         while True:
             t_decode = time.perf_counter()
@@ -439,7 +580,16 @@ class ForensicPipeline:
                 )[0]
                 profiler.add("yolo", time.perf_counter() - t_yolo)
                 people, bikes = _parse_det_result(results, det.names)
-                last_people, last_bikes = people, bikes
+                # CRITICAL: never wipe carry-state with an empty detection frame.
+                # Sparse CCTV detections (e.g. moto only at 00:03.83) must persist.
+                if bikes:
+                    last_bikes = bikes
+                else:
+                    bikes = last_bikes
+                if people:
+                    last_people = people
+                else:
+                    people = last_people
             else:
                 t_trk = time.perf_counter()
                 # Tracker carry: reuse last detections/track IDs for temporal coverage
@@ -450,22 +600,37 @@ class ForensicPipeline:
                 if bike["trackId"] >= 0:
                     moto_ids.add(bike["trackId"])
 
-            # Build rider associations first, then batch helmet
+            # Build rider associations first, then batch helmet (multi-crop ensemble)
             pending_helmet: list[dict] = []
+            crop_batch: list = []
+            crop_owners: list[tuple[int, int]] = []  # (pending_idx, variant_idx)
 
             for bike in bikes:
                 rider = associate_driver(bike["box"], people)
+                rider_source = "PERSON"
+                if rider is None and self.config.enable_moto_proxy_rider:
+                    proxy_box = moto_proxy_person_box(
+                        bike["box"], frame.shape[1], frame.shape[0]
+                    )
+                    if proxy_box:
+                        rider = {
+                            "box": proxy_box,
+                            "confidence": float(bike["confidence"]) * 0.55,
+                            "trackId": bike["trackId"],
+                            "class": "person_proxy",
+                            "proxy": True,
+                        }
+                        rider_source = "MOTO_PROXY"
                 if rider is None:
                     continue
-                tid = bike["trackId"] if bike["trackId"] >= 0 else rider["trackId"]
+                tid = bike["trackId"] if bike["trackId"] >= 0 else rider.get("trackId", -1)
                 if tid < 0:
-                    continue
+                    tid = 900000 + (int(bike["box"][0]) // 20) % 90000
                 if tid not in tracks:
                     tracks[tid] = TrackState(tid, frame_idx, timestamp)
                 track = tracks[tid]
                 track.touch(frame_idx, timestamp)
 
-                # Bound history growth
                 if len(track.motorcycle_boxes) < 200 or frame_idx % 5 == 0:
                     track.motorcycle_boxes.append(
                         {
@@ -481,6 +646,7 @@ class ForensicPipeline:
                         "timestamp": timestamp,
                         "box": rider["box"],
                         "conf": rider["confidence"],
+                        "source": rider_source,
                     }
                 )
                 if len(track.person_boxes) > 400:
@@ -490,11 +656,11 @@ class ForensicPipeline:
                     track.cached_kpts is None
                     or (frame_idx - track.last_pose_frame) >= pose_interval
                     or run_detector
-                )
+                ) and not rider.get("proxy")
                 kpts = track.cached_kpts
+                pose_ok = False
                 if need_pose:
                     t_pose = time.perf_counter()
-                    # Pose on person crop only (much cheaper than full-frame 1280 pose)
                     x1, y1, x2, y2 = map(int, rider["box"])
                     pad = 8
                     x1, y1 = max(0, x1 - pad), max(0, y1 - pad)
@@ -503,7 +669,7 @@ class ForensicPipeline:
                     if crop.size:
                         pose_res = pose.predict(
                             source=crop,
-                            conf=0.25,
+                            conf=0.20 if self.config.is_aggressive else 0.25,
                             imgsz=320,
                             **yolo_kw,
                         )[0]
@@ -512,49 +678,110 @@ class ForensicPipeline:
                             and len(pose_res.keypoints) > 0
                         ):
                             local = pose_res.keypoints.data[0].cpu().numpy()
-                            # Map crop coords → full frame
                             mapped = local.copy()
                             mapped[:, 0] += x1
                             mapped[:, 1] += y1
-                            kpts = mapped
-                            track.cached_kpts = kpts
-                            track.last_pose_frame = frame_idx
+                            head_pts = mapped[:5]
+                            if np.any(head_pts[:, 2] >= 0.20):
+                                kpts = mapped
+                                track.cached_kpts = kpts
+                                track.last_pose_frame = frame_idx
+                                pose_ok = True
                     profiler.add("pose", time.perf_counter() - t_pose)
+                elif track.cached_kpts is not None:
+                    pose_ok = True
+                    kpts = track.cached_kpts
 
-                head_img, head_box = head_crop_from_keypoints(frame, kpts, rider["box"])
-                if head_box is not None:
-                    track.cached_head_box = head_box
-                if head_img is None:
+                if self.config.enable_multi_crop or self.config.is_aggressive:
+                    variants = build_head_crop_variants(
+                        frame,
+                        rider["box"],
+                        kpts=kpts if pose_ok else None,
+                        top_ratio=self.config.fallback_head_top_ratio,
+                        top_ratio_tight=self.config.fallback_head_top_ratio_tight,
+                        expand=self.config.fallback_head_expand,
+                        min_px=self.config.min_head_crop_px,
+                        classify_size=self.config.head_classify_size,
+                        include_enhanced=self.config.enable_helmet_enhance_rescue,
+                    )
+                else:
+                    head_img, head_box = head_crop_from_keypoints(
+                        frame, kpts if pose_ok else None, rider["box"]
+                    )
+                    variants = []
+                    if head_img is not None:
+                        variants.append(
+                            {
+                                "source": "POSE" if pose_ok else "FALLBACK",
+                                "box": head_box,
+                                "image": head_img,
+                                "raw": head_img,
+                            }
+                        )
+
+                if not variants:
                     continue
 
+                pending_idx = len(pending_helmet)
                 pending_helmet.append(
                     {
                         "track": track,
                         "tid": tid,
                         "bike": bike,
                         "rider": rider,
-                        "head_img": head_img,
-                        "head_box": head_box,
+                        "rider_source": rider_source,
+                        "pose_ok": pose_ok,
+                        "variants": variants,
                     }
                 )
+                for vi, var in enumerate(variants):
+                    crop_batch.append(var["image"])
+                    crop_owners.append((pending_idx, vi))
 
-            # Batched helmet inference
-            if pending_helmet:
+            # Batched helmet inference across all crop variants
+            frame_anns: list[dict] = []
+            if pending_helmet and crop_batch:
                 t_hel = time.perf_counter()
-                crops = [p["head_img"] for p in pending_helmet]
-                # Process in chunks
                 results_h: list[tuple[str, float, float]] = []
                 bs = max(1, self.config.helmet_batch_size)
-                for i in range(0, len(crops), bs):
-                    results_h.extend(helmet.classify_batch(crops[i : i + bs]))
+                for i in range(0, len(crop_batch), bs):
+                    results_h.extend(helmet.classify_batch(crop_batch[i : i + bs]))
                 profiler.add("helmet", time.perf_counter() - t_hel)
 
-                for item, (pred, helmet_p, no_helmet_p) in zip(pending_helmet, results_h):
+                per_item: list[list[tuple[dict, tuple]]] = [[] for _ in pending_helmet]
+                for (pi, vi), res in zip(crop_owners, results_h):
+                    per_item[pi].append((pending_helmet[pi]["variants"][vi], res))
+
+                for item, variant_results in zip(pending_helmet, per_item):
+                    if not variant_results:
+                        continue
                     track = item["track"]
                     rider = item["rider"]
                     bike = item["bike"]
-                    head_box = item["head_box"]
-                    head_img = item["head_img"]
+                    tid = item["tid"]
+
+                    scored = sorted(
+                        variant_results,
+                        key=lambda vr: float(vr[1][2]),
+                        reverse=True,
+                    )
+                    best_var, (_pred0, best_h, best_nh) = scored[0]
+                    top_nh = [float(vr[1][2]) for vr in scored[: min(3, len(scored))]]
+                    top_h = [float(vr[1][1]) for vr in scored[: min(3, len(scored))]]
+                    no_helmet_p = float(np.mean(top_nh))
+                    no_helmet_max = float(best_nh)
+                    helmet_p = float(np.mean(top_h))
+                    if self.config.is_aggressive:
+                        no_helmet_p = 0.5 * no_helmet_p + 0.5 * no_helmet_max
+                    pred = soft_helmet_label(helmet_p, no_helmet_p, self.config)
+                    head_box = best_var.get("box")
+                    head_img = best_var.get("raw")
+                    if head_img is None:
+                        head_img = best_var.get("image")
+                    head_source = best_var.get("source", "UNKNOWN")
+
+                    if head_box is not None:
+                        track.cached_head_box = head_box
 
                     q = quality_score(frame, rider["box"], rider["confidence"])
                     hq = quality_score(
@@ -566,14 +793,57 @@ class ForensicPipeline:
                         "prediction": pred,
                         "helmetProbability": round(helmet_p, 4),
                         "noHelmetProbability": round(no_helmet_p, 4),
+                        "noHelmetMax": round(no_helmet_max, 4),
                         "riderBox": rider["box"],
                         "headBox": head_box,
                         "quality": q,
                         "headQuality": hq,
+                        "headSource": head_source,
+                        "riderSource": item["rider_source"],
+                        "poseSuccess": bool(item["pose_ok"]),
+                        "motorcycleConfidence": round(float(bike["confidence"]), 4),
+                        "personConfidence": round(float(rider["confidence"]), 4),
+                        "cropCount": len(variant_results),
                     }
                     track.helmet_preds.append(pred_rec)
                     if len(track.helmet_preds) > 600:
                         track.helmet_preds = track.helmet_preds[-400:]
+
+                    if self.config.debug_mode or (
+                        self.config.is_aggressive and pred == "no_helmet"
+                    ):
+                        debug_logs.append(
+                            {
+                                "trackId": tid,
+                                "timestamp": round(timestamp, 4),
+                                "frame": frame_idx,
+                                "motorcycleConfidence": pred_rec["motorcycleConfidence"],
+                                "personConfidence": pred_rec["personConfidence"],
+                                "poseSuccess": pred_rec["poseSuccess"],
+                                "headCropSource": head_source,
+                                "headCropSize": None
+                                if head_img is None
+                                else [int(head_img.shape[1]), int(head_img.shape[0])],
+                                "helmetProbability": pred_rec["helmetProbability"],
+                                "noHelmetProbability": pred_rec["noHelmetProbability"],
+                                "prediction": pred,
+                                "riderSource": item["rider_source"],
+                            }
+                        )
+
+                    frame_anns.append(
+                        {
+                            "id": tid,
+                            "box": rider["box"],
+                            "moto": bike["box"],
+                            "head": head_box,
+                            "pred": pred,
+                            "nh": round(no_helmet_p, 4),
+                            "h": round(helmet_p, 4),
+                            "src": head_source,
+                            "pose": bool(item["pose_ok"]),
+                        }
+                    )
 
                     overall_score = q["score"] * (0.5 + 0.5 * no_helmet_p)
                     overall = {**pred_rec, "score": overall_score}
@@ -581,13 +851,16 @@ class ForensicPipeline:
                         track.best_overall = {
                             **overall,
                             "image": frame.copy(),
-                            "headImage": head_img.copy(),
+                            "headImage": None if head_img is None else head_img.copy(),
                         }
-                    if track.best_rider is None or q["score"] > track.best_rider["quality"]["score"]:
+                    if (
+                        track.best_rider is None
+                        or q["score"] > track.best_rider["quality"]["score"]
+                    ):
                         track.best_rider = {
                             **pred_rec,
                             "image": frame.copy(),
-                            "headImage": head_img.copy(),
+                            "headImage": None if head_img is None else head_img.copy(),
                         }
                     if (
                         track.best_head is None
@@ -596,15 +869,14 @@ class ForensicPipeline:
                         track.best_head = {
                             **pred_rec,
                             "image": frame.copy(),
-                            "headImage": head_img.copy(),
+                            "headImage": None if head_img is None else head_img.copy(),
                         }
 
-                    # Only queue plate candidate metadata (no plate model yet)
                     if (
                         self.config.enable_plate_ocr
                         and pred == "no_helmet"
-                        and no_helmet_p >= 0.7
-                        and q["score"] >= 0.35
+                        and no_helmet_p >= (0.45 if self.config.is_aggressive else 0.7)
+                        and q["score"] >= 0.30
                     ):
                         mx1, my1, mx2, my2 = bike["box"]
                         region = clamp_box(
@@ -638,23 +910,13 @@ class ForensicPipeline:
                                     reverse=True,
                                 )[:20]
 
-            if writer is not None:
-                t_out = time.perf_counter()
-                vis = frame
-                # cheap overlays without full copy when possible
-                vis = frame.copy()
-                for bike in bikes:
-                    x1, y1, x2, y2 = map(int, bike["box"])
-                    cv2.rectangle(vis, (x1, y1), (x2, y2), (255, 180, 40), 2)
-                for tid, track in tracks.items():
-                    if track.last_frame != frame_idx or not track.helmet_preds:
-                        continue
-                    last = track.helmet_preds[-1]
-                    color = (40, 170, 80) if last["prediction"] == "helmet" else (40, 60, 220)
-                    x1, y1, x2, y2 = map(int, last["riderBox"])
-                    cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
-                writer.write(vis)
-                profiler.add("output_video", time.perf_counter() - t_out)
+            # Persist lightweight frame annotations for post-hoc video render
+            timeline_f.write(
+                json.dumps(
+                    {"f": frame_idx, "t": round(timestamp, 4), "tracks": frame_anns}
+                )
+                + "\n"
+            )
 
             frame_idx += 1
             now = time.time()
@@ -685,10 +947,6 @@ class ForensicPipeline:
                     profiling=profiler.snapshot(),
                 )
                 last_progress = now
-
-        decoder_meta["stopped"] = True
-        if writer is not None:
-            writer.release()
 
         # -------- Post-pass: plate detection + OCR only for candidates --------
         violations = []
@@ -805,6 +1063,10 @@ class ForensicPipeline:
             primary = track.best_overall or track.best_rider or track.best_head
             if primary is None:
                 continue
+
+            # UI ticket status: CONFIRMED only when temporal rules pass; else NEEDS_REVIEW
+            ticket_status = "CONFIRMED" if track.state == "CONFIRMED" else "NEEDS_REVIEW"
+            ticket_number = len(violations) + 1
             violation_id = f"VIO-{video_id[:8]}-{tid}-{uuid.uuid4().hex[:6]}"
             annotated_img = annotate_evidence(
                 primary["image"],
@@ -838,6 +1100,8 @@ class ForensicPipeline:
 
             violation = {
                 "violationId": violation_id,
+                "ticketId": f"TKT-{ticket_number:03d}",
+                "ticketNumber": ticket_number,
                 "videoId": video_id,
                 "jobId": job_id,
                 "trackId": tid,
@@ -863,7 +1127,8 @@ class ForensicPipeline:
                 "plateValidation": validate_indian_plate(plate_text) if plate_text else None,
                 "gpsLatitude": None,
                 "gpsLongitude": None,
-                "status": track.state,
+                "status": ticket_status,
+                "pipelineState": track.state,
                 "primaryEvidencePath": f"/cctv/{video_id}/evidence/{violation_id}_primary.jpg",
                 "annotatedEvidencePath": f"/cctv/{video_id}/evidence/{violation_id}_annotated.jpg",
                 "headCropPath": f"/cctv/{video_id}/evidence/{violation_id}_head.jpg",
@@ -882,36 +1147,117 @@ class ForensicPipeline:
             track.best_head = None
             track.plate_candidates = []
 
+        # Sort tickets by timestamp for stable numbering display (already sequential as created)
+        violations.sort(key=lambda v: (v["timestamp"], v["trackId"]))
+        for i, v in enumerate(violations, start=1):
+            v["ticketNumber"] = i
+            v["ticketId"] = f"TKT-{i:03d}"
+            self.store.save_violation(v)
+
         confirmed = [v for v in violations if v["status"] == "CONFIRMED"]
-        potential = [v for v in violations if v["status"] == "POTENTIAL"]
+        needs_review = [v for v in violations if v["status"] == "NEEDS_REVIEW"]
+
+        # Persist debug helmet logs for SIH tuning
+        if debug_logs:
+            dbg_path = job_dir / "debug_helmet.jsonl"
+            with open(dbg_path, "w", encoding="utf-8") as df:
+                for row in debug_logs:
+                    df.write(json.dumps(row) + "\n")
+
+        # -------- Post-hoc annotated video (NO second ML inference) --------
+        annotated_video_url = None
+        annotated_video_path = None
+        if self.config.enable_output_video:
+            self.store.update_job(
+                job_id,
+                progressPercentage=99,
+                status="PROCESSING",
+                etaSeconds=None,
+            )
+            t_render = time.perf_counter()
+            tracks_meta: dict[int, dict] = {}
+            for tid, track in tracks.items():
+                d = temporal_decision(track, self.config)
+                tracks_meta[tid] = {
+                    "state": track.state or d["state"],
+                    "avgNoHelmetConfidence": d.get("avgNoHelmetConfidence", 0),
+                    "avgNoHelmetAllFrames": d.get("avgNoHelmetAllFrames", 0),
+                    "avgHelmetConfidence": d.get("avgHelmetConfidence", 0),
+                    "helmetRatio": d.get("helmetRatio", 0),
+                    "helmetVotes": int(
+                        round(float(d.get("helmetRatio", 0)) * float(d.get("trackFrames", 0)))
+                    ),
+                    "helmetConfidence": d.get("avgHelmetConfidence", 0),
+                    "debugMode": bool(self.config.debug_mode),
+                }
+            tracks_meta_path = job_dir / "tracks_meta.json"
+            with open(tracks_meta_path, "w", encoding="utf-8") as mf:
+                json.dump({str(k): v for k, v in tracks_meta.items()}, mf)
+
+            violations_by_track = {int(v["trackId"]): v for v in violations}
+            track_display = build_track_display(tracks_meta, violations_by_track)
+            with open(job_dir / "track_display.json", "w", encoding="utf-8") as df:
+                json.dump({str(k): v for k, v in track_display.items()}, df)
+
+            annotated_path = job_dir / "annotated.mp4"
+            playable_path = render_annotated_video(
+                source_video=video_path,
+                timeline_path=timeline_path,
+                track_display=track_display,
+                output_path=annotated_path,
+                fps=fps,
+                width=int(meta["width"]),
+                height=int(meta["height"]),
+            )
+            annotated_path = Path(playable_path)
+            # Also copy under public for optional static access
+            public_annotated = self.config.public_dir / video_id / annotated_path.name
+            public_annotated.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                import shutil as _shutil
+
+                _shutil.copy2(annotated_path, public_annotated)
+            except Exception:
+                pass
+
+            profiler.add("output_video", time.perf_counter() - t_render)
+            annotated_video_path = str(annotated_path)
+            annotated_video_url = f"/api/cctv/jobs/{job_id}/video"
+
         profiling = profiler.snapshot()
         elapsed = profiling["totalSeconds"]
         summary = {
             "framesAnalyzed": total,
             "motorcycles": len(moto_ids),
             "tracks": len(tracks),
-            "noHelmetCandidates": len(potential) + len(confirmed),
+            "noHelmetCandidates": len(needs_review) + len(confirmed),
             "confirmedViolations": len(confirmed),
+            "needsReviewViolations": len(needs_review),
             "licensePlatesRecognized": plates_read,
             "platesDetected": plates_detected,
-            "annotatedVideoPath": f"/cctv/{video_id}/annotated.mp4" if annotated_path else None,
+            "annotatedVideoPath": annotated_video_path,
+            "annotatedVideoUrl": annotated_video_url,
             "detectionInterval": det_interval,
             "imgsz": imgsz,
+            "detectionMode": self.config.detection_mode,
+            "detConf": self.config.det_conf,
             "processingSeconds": elapsed,
             "processingFps": round(total / max(1e-3, elapsed), 2),
+            "debugLogCount": len(debug_logs),
         }
         self.store.save_video(
             {
                 **(self.store.get_video(video_id) or {"videoId": video_id}),
                 "summary": summary,
-                "annotatedVideoPath": summary["annotatedVideoPath"],
+                "annotatedVideoPath": annotated_video_path,
+                "annotatedVideoUrl": annotated_video_url,
             }
         )
         return {
             "jobStats": {
                 "detections": sum(len(t.helmet_preds) for t in tracks.values()),
                 "activeTracks": 0,
-                "candidateViolations": len(potential) + len(confirmed),
+                "candidateViolations": len(needs_review) + len(confirmed),
                 "confirmedViolations": len(confirmed),
                 "platesRead": plates_read,
                 "platesDetected": plates_detected,
@@ -922,6 +1268,8 @@ class ForensicPipeline:
             "profiling": profiling,
             "gpu": gpu_info(),
             "violations": violations,
+            "annotatedVideoPath": annotated_video_path,
+            "annotatedVideoUrl": annotated_video_url,
         }
 
 

@@ -40,7 +40,8 @@ class VotingTests(unittest.TestCase):
         return t
 
     def test_one_hundred_no_helmet_frames_single_candidate(self):
-        cfg = CctvConfig()
+        cfg = CctvConfig(detection_mode="normal")
+        cfg.apply_mode_defaults()
         preds = [
             {
                 "prediction": "no_helmet",
@@ -54,7 +55,8 @@ class VotingTests(unittest.TestCase):
         self.assertEqual(decision["noHelmetVotes"], 100)
 
     def test_one_blurry_no_helmet_among_helmet_majority(self):
-        cfg = CctvConfig()
+        cfg = CctvConfig(detection_mode="normal")
+        cfg.apply_mode_defaults()
         preds = [
             {
                 "prediction": "helmet",
@@ -72,6 +74,20 @@ class VotingTests(unittest.TestCase):
         )
         decision = temporal_decision(self._track(preds), cfg)
         self.assertEqual(decision["state"], "NORMAL")
+
+    def test_aggressive_borderline_becomes_potential(self):
+        cfg = CctvConfig(detection_mode="aggressive")
+        cfg.apply_mode_defaults()
+        preds = [
+            {
+                "prediction": "no_helmet",
+                "helmetProbability": 0.45,
+                "noHelmetProbability": 0.55,
+            }
+            for _ in range(6)
+        ]
+        decision = temporal_decision(self._track(preds), cfg)
+        self.assertIn(decision["state"], {"POTENTIAL", "CONFIRMED", "NEEDS_REVIEW"})
 
 
 class PlateTests(unittest.TestCase):

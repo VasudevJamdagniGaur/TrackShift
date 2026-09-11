@@ -89,8 +89,182 @@ def clamp_box(x1, y1, x2, y2, w, h):
     return [x1, y1, x2, y2]
 
 
+def expand_box(box, expand: float, w: int, h: int):
+    x1, y1, x2, y2 = box
+    bw, bh = max(1.0, x2 - x1), max(1.0, y2 - y1)
+    return clamp_box(
+        x1 - expand * bw,
+        y1 - expand * bh,
+        x2 + expand * bw,
+        y2 + expand * bh,
+        w,
+        h,
+    )
+
+
+def letterbox_square(crop: np.ndarray, size: int = 224) -> np.ndarray:
+    """Upscale/pad to square without stretching aspect ratio."""
+    if crop is None or crop.size == 0:
+        return crop
+    ch, cw = crop.shape[:2]
+    scale = float(size) / max(ch, cw)
+    nh, nw = max(1, int(round(ch * scale))), max(1, int(round(cw * scale)))
+    interp = cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA
+    resized = cv2.resize(crop, (nw, nh), interpolation=interp)
+    canvas = np.zeros((size, size, 3), dtype=crop.dtype)
+    oy, ox = (size - nh) // 2, (size - nw) // 2
+    canvas[oy : oy + nh, ox : ox + nw] = resized
+    return canvas
+
+
+def enhance_head_crop(crop: np.ndarray) -> np.ndarray:
+    """Mild CLAHE + unsharp for rescue classification only (evidence stays original)."""
+    if crop is None or crop.size == 0:
+        return crop
+    out = crop.copy()
+    try:
+        lab = cv2.cvtColor(out, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(4, 4))
+        l2 = clahe.apply(l)
+        out = cv2.cvtColor(cv2.merge([l2, a, b]), cv2.COLOR_LAB2BGR)
+        blur = cv2.GaussianBlur(out, (0, 0), 1.0)
+        out = cv2.addWeighted(out, 1.35, blur, -0.35, 0)
+    except Exception:
+        return crop
+    return out
+
+
+def fallback_head_box(person_box, frame_w: int, frame_h: int, top_ratio: float, expand: float):
+    x1, y1, x2, y2 = person_box
+    ph = max(1.0, y2 - y1)
+    raw = [x1, y1, x2, y1 + top_ratio * ph]
+    box = clamp_box(*raw, frame_w, frame_h)
+    if not box:
+        return None
+    return expand_box(box, expand, frame_w, frame_h)
+
+
+def crop_from_box(frame: np.ndarray, box) -> np.ndarray | None:
+    if not box:
+        return None
+    x1, y1, x2, y2 = map(int, box)
+    crop = frame[y1:y2, x1:x2]
+    if crop is None or crop.size == 0:
+        return None
+    return crop
+
+
+def prepare_classify_crop(crop: np.ndarray, min_px: int = 96, size: int = 224) -> np.ndarray:
+    if crop is None or crop.size == 0:
+        return crop
+    h, w = crop.shape[:2]
+    if min(h, w) < min_px or max(h, w) < size:
+        return letterbox_square(crop, size)
+    return letterbox_square(crop, size)
+
+
+def build_head_crop_variants(
+    frame: np.ndarray,
+    person_box,
+    kpts=None,
+    top_ratio: float = 0.45,
+    top_ratio_tight: float = 0.35,
+    expand: float = 0.15,
+    min_px: int = 96,
+    classify_size: int = 224,
+    include_enhanced: bool = True,
+) -> list[dict[str, Any]]:
+    """
+    Multi-crop head bundle for helmet ensemble.
+    Sources: pose, fallback 45%, fallback 35%, expanded pose, optional enhanced copies.
+    """
+    h, w = frame.shape[:2]
+    variants: list[dict[str, Any]] = []
+
+    pose_img, pose_box = head_crop_from_keypoints(frame, kpts, person_box)
+    if pose_img is not None and pose_box is not None:
+        variants.append(
+            {
+                "source": "POSE",
+                "box": pose_box,
+                "image": prepare_classify_crop(pose_img, min_px, classify_size),
+                "raw": pose_img,
+            }
+        )
+        expanded = expand_box(pose_box, expand, w, h)
+        exp_img = crop_from_box(frame, expanded)
+        if exp_img is not None:
+            variants.append(
+                {
+                    "source": "POSE_EXPANDED",
+                    "box": expanded,
+                    "image": prepare_classify_crop(exp_img, min_px, classify_size),
+                    "raw": exp_img,
+                }
+            )
+
+    fb45 = fallback_head_box(person_box, w, h, top_ratio, expand)
+    fb45_img = crop_from_box(frame, fb45)
+    if fb45_img is not None:
+        variants.append(
+            {
+                "source": "FALLBACK_45",
+                "box": fb45,
+                "image": prepare_classify_crop(fb45_img, min_px, classify_size),
+                "raw": fb45_img,
+            }
+        )
+
+    fb35 = fallback_head_box(person_box, w, h, top_ratio_tight, expand * 0.8)
+    fb35_img = crop_from_box(frame, fb35)
+    if fb35_img is not None:
+        variants.append(
+            {
+                "source": "FALLBACK_35",
+                "box": fb35,
+                "image": prepare_classify_crop(fb35_img, min_px, classify_size),
+                "raw": fb35_img,
+            }
+        )
+
+    if include_enhanced:
+        base = list(variants)
+        for v in base:
+            enh = enhance_head_crop(v["raw"])
+            if enh is None or enh.size == 0:
+                continue
+            variants.append(
+                {
+                    "source": f"{v['source']}_ENHANCED",
+                    "box": v["box"],
+                    "image": prepare_classify_crop(enh, min_px, classify_size),
+                    "raw": enh,
+                }
+            )
+
+    # Deduplicate empty
+    return [v for v in variants if v.get("image") is not None and v["image"].size > 0]
+
+
+def moto_proxy_person_box(moto_box, frame_w: int, frame_h: int):
+    """When person detector misses the rider, use upper motorcycle region as proxy."""
+    x1, y1, x2, y2 = moto_box
+    mw, mh = max(1.0, x2 - x1), max(1.0, y2 - y1)
+    # Rider typically occupies upper-central portion of moto bbox
+    return clamp_box(
+        x1 + 0.12 * mw,
+        y1,
+        x2 - 0.08 * mw,
+        y1 + 0.72 * mh,
+        frame_w,
+        frame_h,
+    )
+
+
 def box_center(box):
     return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+
 
 
 def iou(a, b) -> float:

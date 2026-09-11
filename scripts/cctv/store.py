@@ -18,7 +18,16 @@ def _atomic_write(path: Path, payload: Any) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, path)
+        try:
+            os.replace(tmp, path)
+        except PermissionError:
+            # Windows: index/job may be briefly locked by antivirus or another reader
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
     finally:
         if os.path.exists(tmp):
             try:
@@ -138,12 +147,16 @@ class CctvStore:
         }
 
     def _touch_index(self, key: str, item_id: str) -> None:
-        index = _read(self.index_path, {"videos": [], "jobs": [], "violations": []})
-        arr = index.setdefault(key, [])
-        if item_id not in arr:
-            arr.insert(0, item_id)
-        index["updatedAt"] = _now()
-        _atomic_write(self.index_path, index)
+        try:
+            index = _read(self.index_path, {"videos": [], "jobs": [], "violations": []})
+            arr = index.setdefault(key, [])
+            if item_id not in arr:
+                arr.insert(0, item_id)
+            index["updatedAt"] = _now()
+            _atomic_write(self.index_path, index)
+        except OSError:
+            # Index is best-effort; job/video/violation files are the source of truth
+            pass
 
 
 def _now() -> str:
