@@ -34,6 +34,15 @@ import numpy as np
 from .config import CONFIG, CctvConfig
 from .model_manager import ModelManager, gpu_info
 from .render_video import build_track_display, render_annotated_video
+from .road_branch import RoadAnalyzer
+from .rider_association import (
+    RIDER_CONFIRMED,
+    RIDER_NO_RIDER,
+    RIDER_UNCERTAIN,
+    can_run_helmet_classifier,
+    find_best_rider,
+    update_rider_state,
+)
 from .store import CctvStore
 from .utils import (
     box_center,
@@ -41,8 +50,6 @@ from .utils import (
     clamp_box,
     enhance_frame,
     head_crop_from_keypoints,
-    iou,
-    moto_proxy_person_box,
     quality_score,
     validate_indian_plate,
     weighted_ocr_vote,
@@ -95,6 +102,18 @@ class TrackState:
         self.cached_kpts = None
         self.cached_head_box = None
         self.last_pose_frame = -10_000
+        # Rider association state machine
+        self.rider_state = RIDER_NO_RIDER
+        self.rider_association_score = 0.0
+        self.rider_assoc_frames = 0
+        self.rider_lost_frames = 0
+        self.rider_confirmed_once = False
+        self.rider_person_track_id: int | None = None
+        self.last_rider_box = None
+        self.last_rider_person: dict | None = None
+        self.last_rider_assoc: dict | None = None
+        self.last_rider_frame = -10_000
+        self.helmet_gate_skips = 0
 
     def touch(self, frame_idx: int, timestamp: float):
         self.last_frame = frame_idx
@@ -127,62 +146,6 @@ def reject_if_too_long(meta: dict, config: CctvConfig) -> None:
         raise ValueError("Maximum supported video duration is 5 minutes.")
 
 
-def associate_driver(moto_box, people: list[dict], expand: float = 0.30):
-    """
-    Prefer people overlapping / contained in an expanded motorcycle region.
-    Avoid latching onto tiny edge fragments far from the moto interior.
-    """
-    if not people:
-        return None
-    mx1, my1, mx2, my2 = moto_box
-    mw, mh = max(1.0, mx2 - mx1), max(1.0, my2 - my1)
-    mx, my = box_center(moto_box)
-    expanded = [
-        mx1 - expand * mw,
-        my1 - expand * mh,
-        mx2 + expand * mw,
-        my2 + 0.15 * mh,
-    ]
-    moto_area = mw * mh
-    scored: list[tuple[float, dict]] = []
-    for person in people:
-        pb = person["box"]
-        px, py = box_center(pb)
-        pw, ph = max(1.0, pb[2] - pb[0]), max(1.0, pb[3] - pb[1])
-        area_ratio = (pw * ph) / max(1.0, moto_area)
-        overlap = iou(pb, expanded)
-        center_in = (
-            expanded[0] <= px <= expanded[2] and expanded[1] <= py <= expanded[3]
-        )
-        dist = (((px - mx) ** 2 + (py - my) ** 2) ** 0.5) / max(mw, mh)
-        score = (
-            3.0 * overlap
-            + (1.2 if center_in else 0.0)
-            + 0.35 * float(person.get("confidence") or 0.0)
-            - 0.55 * dist
-        )
-        # Tiny fragments relative to moto are usually wrong associations
-        if area_ratio < 0.03:
-            score *= 0.25
-        if area_ratio < 0.08 and overlap < 0.05:
-            score *= 0.4
-        # Person mostly below moto center is less likely the rider
-        if py > my + mh * 0.55:
-            score *= 0.25
-        scored.append((score, person))
-    scored.sort(key=lambda x: -x[0])
-    if not scored:
-        return None
-    best_score, best_person = scored[0]
-    pb = best_person["box"]
-    pw, ph = max(1.0, pb[2] - pb[0]), max(1.0, pb[3] - pb[1])
-    area_ratio = (pw * ph) / max(1.0, moto_area)
-    # Reject weak / fragment associations so moto-proxy rider can activate
-    if best_score < 0.35 or area_ratio < 0.05:
-        return None
-    return best_person
-
-
 def soft_helmet_label(helmet_p: float, no_helmet_p: float, config: CctvConfig) -> str:
     """Recall-first soft label: candidate threshold beats pure argmax."""
     if no_helmet_p >= config.no_helmet_candidate_prob:
@@ -191,7 +154,27 @@ def soft_helmet_label(helmet_p: float, no_helmet_p: float, config: CctvConfig) -
 
 
 def temporal_decision(track: TrackState, config: CctvConfig) -> dict[str, Any]:
-    preds = track.helmet_preds
+    # Only count helmet votes from confirmed-rider + pose-head evidence.
+    # Pose-failed / no-rider frames must not create NO HELMET tickets.
+    preds_all = track.helmet_preds
+
+    def _eligible(p: dict) -> bool:
+        # Unit-test / legacy records without rider metadata still count
+        if "riderState" not in p and "poseSuccess" not in p:
+            return True
+        if p.get("riderState") != RIDER_CONFIRMED:
+            return False
+        if not (
+            p.get("poseSuccess")
+            or str(p.get("headSource") or "").startswith("POSE")
+        ):
+            return False
+        score = p.get("riderAssociationScore")
+        if score is not None and float(score) < float(config.min_rider_association_score):
+            return False
+        return True
+
+    preds = [p for p in preds_all if _eligible(p)]
     n = len(preds)
     if n < config.min_track_frames:
         return {"state": "NORMAL", "reason": "insufficient_frames", **_vote_stats(preds)}
@@ -445,6 +428,7 @@ class ForensicPipeline:
         pose = loaded["pose"]
         plate_det = loaded["plate"]
         ocr = loaded["ocr"]
+        road_model = loaded.get("road")
         yolo_kw = self.models.yolo_kwargs()
         imgsz = int(self.config.imgsz)  # MUST remain 1280
         assert imgsz == 1280 or imgsz >= 1280, "Detector imgsz must stay >= 1280"
@@ -453,7 +437,9 @@ class ForensicPipeline:
 
         out_dir = self.config.public_dir / video_id
         evidence_dir = out_dir / "evidence"
+        road_evidence_dir = out_dir / "road_evidence"
         evidence_dir.mkdir(parents=True, exist_ok=True)
+        road_evidence_dir.mkdir(parents=True, exist_ok=True)
         job_dir = self.config.data_dir / "jobs" / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
         timeline_path = job_dir / "timeline.jsonl"
@@ -461,6 +447,16 @@ class ForensicPipeline:
         fps = float(meta["fps"])
         total = int(meta["frameCount"])
         profiler = Profiler()
+
+        road_analyzer = None
+        if self.config.enable_road_damage and road_model is not None:
+            road_analyzer = RoadAnalyzer(
+                road_model,
+                conf=self.config.road_conf,
+                imgsz=self.config.road_imgsz,
+                interval=self.config.road_interval,
+                yolo_kwargs=yolo_kw,
+            )
 
         # Annotated video is rendered AFTER analysis from timeline (no second ML pass)
         timeline_f = open(timeline_path, "w", encoding="utf-8")
@@ -485,6 +481,7 @@ class ForensicPipeline:
                 meta=meta,
                 out_dir=out_dir,
                 evidence_dir=evidence_dir,
+                road_evidence_dir=road_evidence_dir,
                 job_dir=job_dir,
                 timeline_path=timeline_path,
                 timeline_f=timeline_f,
@@ -495,6 +492,7 @@ class ForensicPipeline:
                 pose=pose,
                 plate_det=plate_det,
                 ocr=ocr,
+                road_analyzer=road_analyzer,
                 yolo_kw=yolo_kw,
                 imgsz=imgsz,
                 det_interval=det_interval,
@@ -524,6 +522,7 @@ class ForensicPipeline:
         video_path = ctx["video_path"]
         meta = ctx["meta"]
         evidence_dir = ctx["evidence_dir"]
+        road_evidence_dir = ctx.get("road_evidence_dir") or (evidence_dir.parent / "road_evidence")
         job_dir = ctx["job_dir"]
         timeline_path = ctx["timeline_path"]
         timeline_f = ctx["timeline_f"]
@@ -534,6 +533,7 @@ class ForensicPipeline:
         pose = ctx["pose"]
         plate_det = ctx["plate_det"]
         ocr = ctx["ocr"]
+        road_analyzer: RoadAnalyzer | None = ctx.get("road_analyzer")
         yolo_kw = ctx["yolo_kw"]
         imgsz = ctx["imgsz"]
         det_interval = ctx["det_interval"]
@@ -600,32 +600,20 @@ class ForensicPipeline:
                 if bike["trackId"] >= 0:
                     moto_ids.add(bike["trackId"])
 
-            # Build rider associations first, then batch helmet (multi-crop ensemble)
+            # Build rider associations first; helmet only after RIDER_CONFIRMED
             pending_helmet: list[dict] = []
             crop_batch: list = []
             crop_owners: list[tuple[int, int]] = []  # (pending_idx, variant_idx)
+            frame_anns: list[dict] = []
 
             for bike in bikes:
-                rider = associate_driver(bike["box"], people)
-                rider_source = "PERSON"
-                if rider is None and self.config.enable_moto_proxy_rider:
-                    proxy_box = moto_proxy_person_box(
-                        bike["box"], frame.shape[1], frame.shape[0]
-                    )
-                    if proxy_box:
-                        rider = {
-                            "box": proxy_box,
-                            "confidence": float(bike["confidence"]) * 0.55,
-                            "trackId": bike["trackId"],
-                            "class": "person_proxy",
-                            "proxy": True,
-                        }
-                        rider_source = "MOTO_PROXY"
-                if rider is None:
-                    continue
-                tid = bike["trackId"] if bike["trackId"] >= 0 else rider.get("trackId", -1)
+                tid = bike["trackId"] if bike["trackId"] >= 0 else -1
                 if tid < 0:
-                    tid = 900000 + (int(bike["box"][0]) // 20) % 90000
+                    # Stable-ish synthetic id from moto center (avoid collapsing
+                    # many parked bikes into a single 900000 mega-track).
+                    mx = int((bike["box"][0] + bike["box"][2]) * 0.5)
+                    my = int((bike["box"][1] + bike["box"][3]) * 0.5)
+                    tid = 900000 + ((mx // 40) % 200) * 200 + (my // 40) % 200
                 if tid not in tracks:
                     tracks[tid] = TrackState(tid, frame_idx, timestamp)
                 track = tracks[tid]
@@ -640,23 +628,95 @@ class ForensicPipeline:
                             "conf": bike["confidence"],
                         }
                     )
-                track.person_boxes.append(
-                    {
-                        "frame": frame_idx,
-                        "timestamp": timestamp,
-                        "box": rider["box"],
-                        "conf": rider["confidence"],
-                        "source": rider_source,
-                    }
-                )
-                if len(track.person_boxes) > 400:
-                    track.person_boxes = track.person_boxes[-200:]
 
+                rider, assoc = find_best_rider(
+                    bike["box"],
+                    people,
+                    expand=self.config.rider_roi_expansion,
+                    min_score=self.config.min_rider_association_score,
+                    person_min_conf=self.config.person_min_confidence,
+                    last_rider_box=track.last_rider_box,
+                    last_person_track_id=track.rider_person_track_id,
+                )
+                # NOTE: ENABLE_MOTO_PROXY_RIDER no longer invents riders from moto
+                # crops. Empty motorcycles stay NO_RIDER (no helmet / pose / OCR).
+
+                rider_state = update_rider_state(
+                    track,
+                    person=rider,
+                    assoc=assoc,
+                    frame_idx=frame_idx,
+                    min_score=self.config.min_rider_association_score,
+                    min_frames=self.config.min_rider_track_frames,
+                    lost_grace_frames=self.config.rider_lost_grace_frames,
+                )
+
+                if rider is not None:
+                    track.person_boxes.append(
+                        {
+                            "frame": frame_idx,
+                            "timestamp": timestamp,
+                            "box": rider["box"],
+                            "conf": rider["confidence"],
+                            "source": "PERSON",
+                            "assocScore": assoc.get("score"),
+                            "riderState": rider_state,
+                        }
+                    )
+                    if len(track.person_boxes) > 400:
+                        track.person_boxes = track.person_boxes[-200:]
+
+                # Default annotation: motorcycle with rider state (no helmet claim)
+                ann = {
+                    "id": tid,
+                    "box": rider["box"] if rider is not None else bike["box"],
+                    "moto": bike["box"],
+                    "head": None,
+                    "pred": None,
+                    "nh": None,
+                    "h": None,
+                    "src": None,
+                    "pose": False,
+                    "riderState": rider_state,
+                    "riderScore": round(float(assoc.get("score") or 0.0), 4),
+                    "motoConf": round(float(bike["confidence"]), 4),
+                    "helmetAnalyzed": False,
+                    "personConf": round(float(rider["confidence"]), 4)
+                    if rider is not None
+                    else None,
+                }
+
+                # CRITICAL GATE: no person / not confirmed → no pose, no helmet, no OCR
+                if rider is None or rider_state != RIDER_CONFIRMED:
+                    track.helmet_gate_skips += 1
+                    if self.config.debug_mode:
+                        debug_logs.append(
+                            {
+                                "trackId": tid,
+                                "timestamp": round(timestamp, 4),
+                                "frame": frame_idx,
+                                "motorcycleConfidence": ann["motoConf"],
+                                "personDetected": rider is not None,
+                                "personConfidence": ann["personConf"],
+                                "riderAssociationScore": ann["riderScore"],
+                                "riderState": rider_state,
+                                "poseSuccess": False,
+                                "headCropSource": None,
+                                "prediction": "NOT_ANALYZED",
+                                "helmetGate": "blocked",
+                                "assocReject": assoc.get("reject"),
+                                "assocFactors": assoc.get("factors"),
+                            }
+                        )
+                    frame_anns.append(ann)
+                    continue
+
+                # ---- Confirmed rider: pose → head → helmet ----
                 need_pose = (
                     track.cached_kpts is None
                     or (frame_idx - track.last_pose_frame) >= pose_interval
                     or run_detector
-                ) and not rider.get("proxy")
+                )
                 kpts = track.cached_kpts
                 pose_ok = False
                 if need_pose:
@@ -692,11 +752,50 @@ class ForensicPipeline:
                     pose_ok = True
                     kpts = track.cached_kpts
 
-                if self.config.enable_multi_crop or self.config.is_aggressive:
+                variants: list[dict] = []
+                if pose_ok:
+                    if self.config.enable_multi_crop or self.config.is_aggressive:
+                        variants = build_head_crop_variants(
+                            frame,
+                            rider["box"],
+                            kpts=kpts,
+                            top_ratio=self.config.fallback_head_top_ratio,
+                            top_ratio_tight=self.config.fallback_head_top_ratio_tight,
+                            expand=self.config.fallback_head_expand,
+                            min_px=self.config.min_head_crop_px,
+                            classify_size=self.config.head_classify_size,
+                            include_enhanced=self.config.enable_helmet_enhance_rescue,
+                        )
+                        # Prefer pose-derived crops; keep pose-enhanced only
+                        has_pose = any(
+                            str(v.get("source", "")).startswith("POSE") for v in variants
+                        )
+                        if has_pose:
+                            variants = [
+                                v
+                                for v in variants
+                                if str(v.get("source", "")).startswith("POSE")
+                            ]
+                    else:
+                        head_img, head_box = head_crop_from_keypoints(
+                            frame, kpts, rider["box"]
+                        )
+                        if head_img is not None:
+                            variants.append(
+                                {
+                                    "source": "POSE",
+                                    "box": head_box,
+                                    "image": head_img,
+                                    "raw": head_img,
+                                }
+                            )
+                elif self.config.allow_fallback_head_after_rider:
+                    # Pose failed: person-bbox fallback for display/rescue only.
+                    # Do NOT feed no-helmet temporal votes from these crops.
                     variants = build_head_crop_variants(
                         frame,
                         rider["box"],
-                        kpts=kpts if pose_ok else None,
+                        kpts=None,
                         top_ratio=self.config.fallback_head_top_ratio,
                         top_ratio_tight=self.config.fallback_head_top_ratio_tight,
                         expand=self.config.fallback_head_expand,
@@ -704,22 +803,89 @@ class ForensicPipeline:
                         classify_size=self.config.head_classify_size,
                         include_enhanced=self.config.enable_helmet_enhance_rescue,
                     )
-                else:
-                    head_img, head_box = head_crop_from_keypoints(
-                        frame, kpts if pose_ok else None, rider["box"]
-                    )
-                    variants = []
-                    if head_img is not None:
-                        variants.append(
+                    track.rider_state = RIDER_UNCERTAIN
+                    ann["riderState"] = RIDER_UNCERTAIN
+                    ann["helmetAnalyzed"] = False
+                    if variants:
+                        ann["head"] = variants[0].get("box")
+                        ann["src"] = variants[0].get("source")
+                    track.helmet_gate_skips += 1
+                    if self.config.debug_mode:
+                        debug_logs.append(
                             {
-                                "source": "POSE" if pose_ok else "FALLBACK",
-                                "box": head_box,
-                                "image": head_img,
-                                "raw": head_img,
+                                "trackId": tid,
+                                "timestamp": round(timestamp, 4),
+                                "frame": frame_idx,
+                                "motorcycleConfidence": ann["motoConf"],
+                                "personDetected": True,
+                                "personConfidence": ann["personConf"],
+                                "riderAssociationScore": ann["riderScore"],
+                                "riderState": RIDER_UNCERTAIN,
+                                "poseSuccess": False,
+                                "headCropSource": ann.get("src"),
+                                "prediction": "NOT_ANALYZED",
+                                "helmetGate": "pose_failed_uncertain",
                             }
                         )
+                    frame_anns.append(ann)
+                    continue
+                else:
+                    track.rider_state = RIDER_UNCERTAIN
+                    ann["riderState"] = RIDER_UNCERTAIN
+                    track.helmet_gate_skips += 1
+                    if self.config.debug_mode:
+                        debug_logs.append(
+                            {
+                                "trackId": tid,
+                                "timestamp": round(timestamp, 4),
+                                "frame": frame_idx,
+                                "motorcycleConfidence": ann["motoConf"],
+                                "personDetected": True,
+                                "personConfidence": ann["personConf"],
+                                "riderAssociationScore": ann["riderScore"],
+                                "riderState": RIDER_UNCERTAIN,
+                                "poseSuccess": False,
+                                "headCropSource": None,
+                                "prediction": "NOT_ANALYZED",
+                                "helmetGate": "pose_failed_no_fallback",
+                            }
+                        )
+                    frame_anns.append(ann)
+                    continue
 
-                if not variants:
+                head_available = bool(variants)
+                # For gate: treat confirmed+pose OR confirmed+allowed fallback as OK
+                gate_track_state = RIDER_CONFIRMED
+                saved_state = track.rider_state
+                track.rider_state = gate_track_state
+                ok_gate, gate_reason = can_run_helmet_classifier(
+                    track,
+                    min_score=self.config.min_rider_association_score,
+                    person_min_conf=self.config.person_min_confidence,
+                    head_available=head_available,
+                )
+                track.rider_state = saved_state
+                if not ok_gate or not variants:
+                    track.helmet_gate_skips += 1
+                    ann["riderState"] = saved_state if saved_state else RIDER_UNCERTAIN
+                    if self.config.debug_mode:
+                        debug_logs.append(
+                            {
+                                "trackId": tid,
+                                "timestamp": round(timestamp, 4),
+                                "frame": frame_idx,
+                                "motorcycleConfidence": ann["motoConf"],
+                                "personDetected": True,
+                                "personConfidence": ann["personConf"],
+                                "riderAssociationScore": ann["riderScore"],
+                                "riderState": ann["riderState"],
+                                "poseSuccess": pose_ok,
+                                "headCropSource": None,
+                                "prediction": "NOT_ANALYZED",
+                                "helmetGate": gate_reason,
+                            }
+                        )
+                    frame_anns.append(ann)
                     continue
 
                 pending_idx = len(pending_helmet)
@@ -729,17 +895,19 @@ class ForensicPipeline:
                         "tid": tid,
                         "bike": bike,
                         "rider": rider,
-                        "rider_source": rider_source,
+                        "rider_source": "PERSON",
                         "pose_ok": pose_ok,
                         "variants": variants,
+                        "assoc": assoc,
+                        "ann": ann,
+                        "rider_state": RIDER_CONFIRMED if pose_ok else RIDER_UNCERTAIN,
                     }
                 )
                 for vi, var in enumerate(variants):
                     crop_batch.append(var["image"])
                     crop_owners.append((pending_idx, vi))
 
-            # Batched helmet inference across all crop variants
-            frame_anns: list[dict] = []
+            # Batched helmet inference across all crop variants (confirmed riders only)
             if pending_helmet and crop_batch:
                 t_hel = time.perf_counter()
                 results_h: list[tuple[str, float, float]] = []
@@ -754,11 +922,13 @@ class ForensicPipeline:
 
                 for item, variant_results in zip(pending_helmet, per_item):
                     if not variant_results:
+                        frame_anns.append(item["ann"])
                         continue
                     track = item["track"]
                     rider = item["rider"]
                     bike = item["bike"]
                     tid = item["tid"]
+                    ann = item["ann"]
 
                     scored = sorted(
                         variant_results,
@@ -803,6 +973,10 @@ class ForensicPipeline:
                         "poseSuccess": bool(item["pose_ok"]),
                         "motorcycleConfidence": round(float(bike["confidence"]), 4),
                         "personConfidence": round(float(rider["confidence"]), 4),
+                        "riderAssociationScore": round(
+                            float(item["assoc"].get("score") or 0.0), 4
+                        ),
+                        "riderState": item["rider_state"],
                         "cropCount": len(variant_results),
                     }
                     track.helmet_preds.append(pred_rec)
@@ -818,7 +992,10 @@ class ForensicPipeline:
                                 "timestamp": round(timestamp, 4),
                                 "frame": frame_idx,
                                 "motorcycleConfidence": pred_rec["motorcycleConfidence"],
+                                "personDetected": True,
                                 "personConfidence": pred_rec["personConfidence"],
+                                "riderAssociationScore": pred_rec["riderAssociationScore"],
+                                "riderState": pred_rec["riderState"],
                                 "poseSuccess": pred_rec["poseSuccess"],
                                 "headCropSource": head_source,
                                 "headCropSize": None
@@ -828,22 +1005,24 @@ class ForensicPipeline:
                                 "noHelmetProbability": pred_rec["noHelmetProbability"],
                                 "prediction": pred,
                                 "riderSource": item["rider_source"],
+                                "helmetGate": "ok",
                             }
                         )
 
-                    frame_anns.append(
+                    ann.update(
                         {
-                            "id": tid,
                             "box": rider["box"],
-                            "moto": bike["box"],
                             "head": head_box,
                             "pred": pred,
                             "nh": round(no_helmet_p, 4),
                             "h": round(helmet_p, 4),
                             "src": head_source,
                             "pose": bool(item["pose_ok"]),
+                            "helmetAnalyzed": True,
+                            "riderState": item["rider_state"],
                         }
                     )
+                    frame_anns.append(ann)
 
                     overall_score = q["score"] * (0.5 + 0.5 * no_helmet_p)
                     overall = {**pred_rec, "score": overall_score}
@@ -877,6 +1056,7 @@ class ForensicPipeline:
                         and pred == "no_helmet"
                         and no_helmet_p >= (0.45 if self.config.is_aggressive else 0.7)
                         and q["score"] >= 0.30
+                        and item["rider_state"] == RIDER_CONFIRMED
                     ):
                         mx1, my1, mx2, my2 = bike["box"]
                         region = clamp_box(
@@ -910,10 +1090,21 @@ class ForensicPipeline:
                                     reverse=True,
                                 )[:20]
 
+            # ---- ROAD DAMAGE BRANCH (same decoded frame, no second video open) ----
+            road_overlay: list[dict] = []
+            if road_analyzer is not None:
+                road_analyzer.process_frame(frame, frame_idx, timestamp, profiler=profiler)
+                road_overlay = road_analyzer.frame_overlays.get(frame_idx, [])
+
             # Persist lightweight frame annotations for post-hoc video render
             timeline_f.write(
                 json.dumps(
-                    {"f": frame_idx, "t": round(timestamp, 4), "tracks": frame_anns}
+                    {
+                        "f": frame_idx,
+                        "t": round(timestamp, 4),
+                        "tracks": frame_anns,
+                        "road": road_overlay,
+                    }
                 )
                 + "\n"
             )
@@ -956,6 +1147,10 @@ class ForensicPipeline:
         for tid, track in tracks.items():
             decision = temporal_decision(track, self.config)
             track.state = decision["state"]
+            # Ticket gate: no helmet votes without confirmed rider analysis
+            if not track.helmet_preds or not getattr(track, "rider_confirmed_once", False):
+                track.state = "NORMAL"
+                continue
             if track.state not in {"POTENTIAL", "CONFIRMED", "NEEDS_REVIEW"}:
                 continue
 
@@ -1157,6 +1352,31 @@ class ForensicPipeline:
         confirmed = [v for v in violations if v["status"] == "CONFIRMED"]
         needs_review = [v for v in violations if v["status"] == "NEEDS_REVIEW"]
 
+        # ---- Finalize ROAD DAMAGE events (aggregator) ----
+        road_events: list[dict] = []
+        road_summary: dict = {
+            "roadEvents": 0,
+            "roadRawHits": 0,
+            "byCategory": {},
+            "byClass": {},
+            "potholes": 0,
+            "cracks": 0,
+            "surfaceDamage": 0,
+        }
+        if road_analyzer is not None:
+            road_events = road_analyzer.finalize_events(
+                video_id=video_id,
+                job_id=job_id,
+                evidence_dir=Path(road_evidence_dir),
+                public_prefix=f"/cctv/{video_id}/road_evidence",
+            )
+            for ev in road_events:
+                self.store.save_road_event(ev)
+            road_summary = road_analyzer.summary(road_events)
+            road_analyzer.write_timeline(job_dir / "road_timeline.jsonl")
+            with open(job_dir / "road_events.json", "w", encoding="utf-8") as rf:
+                json.dump(road_events, rf, indent=2)
+
         # Persist debug helmet logs for SIH tuning
         if debug_logs:
             dbg_path = job_dir / "debug_helmet.jsonl"
@@ -1167,12 +1387,23 @@ class ForensicPipeline:
         # -------- Post-hoc annotated video (NO second ML inference) --------
         annotated_video_url = None
         annotated_video_path = None
+        video_encode_error = None
         if self.config.enable_output_video:
+            # Persist violation counts BEFORE encode so UI is not stuck at "Confirmed: 0"
             self.store.update_job(
                 job_id,
                 progressPercentage=99,
                 status="PROCESSING",
+                stage="ENCODING_VIDEO",
                 etaSeconds=None,
+                confirmedViolations=len(confirmed),
+                candidateViolations=len(needs_review) + len(confirmed),
+                platesRead=plates_read,
+                platesDetected=plates_detected,
+                motorcycles=len(moto_ids),
+                roadEvents=road_summary.get("roadEvents", 0),
+                roadPotholes=road_summary.get("potholes", 0),
+                roadCracks=road_summary.get("cracks", 0),
             )
             t_render = time.perf_counter()
             tracks_meta: dict[int, dict] = {}
@@ -1189,6 +1420,15 @@ class ForensicPipeline:
                     ),
                     "helmetConfidence": d.get("avgHelmetConfidence", 0),
                     "debugMode": bool(self.config.debug_mode),
+                    "riderState": getattr(track, "rider_state", RIDER_NO_RIDER),
+                    "riderAssociationScore": float(
+                        getattr(track, "rider_association_score", 0.0) or 0.0
+                    ),
+                    "riderConfirmedOnce": bool(
+                        getattr(track, "rider_confirmed_once", False)
+                    ),
+                    "helmetGateSkips": int(getattr(track, "helmet_gate_skips", 0) or 0),
+                    "helmetPredCount": len(track.helmet_preds),
                 }
             tracks_meta_path = job_dir / "tracks_meta.json"
             with open(tracks_meta_path, "w", encoding="utf-8") as mf:
@@ -1200,29 +1440,38 @@ class ForensicPipeline:
                 json.dump({str(k): v for k, v in track_display.items()}, df)
 
             annotated_path = job_dir / "annotated.mp4"
-            playable_path = render_annotated_video(
-                source_video=video_path,
-                timeline_path=timeline_path,
-                track_display=track_display,
-                output_path=annotated_path,
-                fps=fps,
-                width=int(meta["width"]),
-                height=int(meta["height"]),
-            )
-            annotated_path = Path(playable_path)
-            # Also copy under public for optional static access
-            public_annotated = self.config.public_dir / video_id / annotated_path.name
-            public_annotated.parent.mkdir(parents=True, exist_ok=True)
             try:
-                import shutil as _shutil
+                playable_path = render_annotated_video(
+                    source_video=video_path,
+                    timeline_path=timeline_path,
+                    track_display=track_display,
+                    output_path=annotated_path,
+                    fps=fps,
+                    width=int(meta["width"]),
+                    height=int(meta["height"]),
+                )
+                annotated_path = Path(playable_path)
+                public_annotated = self.config.public_dir / video_id / annotated_path.name
+                public_annotated.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    import shutil as _shutil
 
-                _shutil.copy2(annotated_path, public_annotated)
-            except Exception:
-                pass
+                    _shutil.copy2(annotated_path, public_annotated)
+                except Exception:
+                    pass
+                annotated_video_path = str(annotated_path)
+                annotated_video_url = f"/api/cctv/jobs/{job_id}/video"
+            except Exception as enc_exc:
+                # Analysis + tickets already saved — do NOT fail the whole job at 99%.
+                video_encode_error = str(enc_exc)
+                # Keep raw OpenCV mp4 if present for offline use / later re-encode
+                if annotated_path.exists() and annotated_path.stat().st_size > 1000:
+                    annotated_video_path = str(annotated_path)
+                annotated_video_url = (
+                    f"/api/cctv/jobs/{job_id}/video" if annotated_video_path else None
+                )
 
             profiler.add("output_video", time.perf_counter() - t_render)
-            annotated_video_path = str(annotated_path)
-            annotated_video_url = f"/api/cctv/jobs/{job_id}/video"
 
         profiling = profiler.snapshot()
         elapsed = profiling["totalSeconds"]
@@ -1244,6 +1493,11 @@ class ForensicPipeline:
             "processingSeconds": elapsed,
             "processingFps": round(total / max(1e-3, elapsed), 2),
             "debugLogCount": len(debug_logs),
+            "videoEncodeError": video_encode_error,
+            "roadDamage": road_summary,
+            "analysisBranches": ["traffic", "road"]
+            if road_analyzer is not None
+            else ["traffic"],
         }
         self.store.save_video(
             {
@@ -1263,6 +1517,9 @@ class ForensicPipeline:
                 "platesDetected": plates_detected,
                 "motorcycles": len(moto_ids),
                 "processingFps": summary["processingFps"],
+                "roadEvents": road_summary.get("roadEvents", 0),
+                "roadPotholes": road_summary.get("potholes", 0),
+                "roadCracks": road_summary.get("cracks", 0),
             },
             "summary": summary,
             "profiling": profiling,
@@ -1270,6 +1527,9 @@ class ForensicPipeline:
             "violations": violations,
             "annotatedVideoPath": annotated_video_path,
             "annotatedVideoUrl": annotated_video_url,
+            "videoEncodeError": video_encode_error,
+            "roadEvents": road_events,
+            "roadSummary": road_summary,
         }
 
 

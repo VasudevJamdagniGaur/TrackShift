@@ -106,5 +106,90 @@ class PlateTests(unittest.TestCase):
         self.assertEqual(vote["normalizedText"], "DL01AB1234")
 
 
+class RiderAssociationTests(unittest.TestCase):
+    def test_empty_moto_no_rider(self):
+        from scripts.cctv.rider_association import find_best_rider
+
+        rider, detail = find_best_rider(
+            [100, 100, 200, 220],
+            [],
+            expand=0.45,
+            min_score=0.65,
+            person_min_conf=0.25,
+        )
+        self.assertIsNone(rider)
+        self.assertEqual(detail.get("reject"), "no_people")
+
+    def test_walking_beside_rejected(self):
+        from scripts.cctv.rider_association import find_best_rider
+
+        moto = [200, 200, 320, 340]
+        # Person far to the side, little overlap
+        walker = {
+            "box": [420, 180, 480, 360],
+            "confidence": 0.9,
+            "trackId": 7,
+        }
+        rider, detail = find_best_rider(
+            moto,
+            [walker],
+            expand=0.45,
+            min_score=0.65,
+            person_min_conf=0.25,
+        )
+        self.assertIsNone(rider)
+        self.assertLess(detail["score"], 0.65)
+
+    def test_sitting_rider_accepted(self):
+        from scripts.cctv.rider_association import (
+            RIDER_CONFIRMED,
+            can_run_helmet_classifier,
+            find_best_rider,
+            update_rider_state,
+        )
+
+        moto = [200, 200, 320, 340]
+        sitting = {
+            "box": [210, 150, 300, 310],
+            "confidence": 0.88,
+            "trackId": 3,
+        }
+        rider, detail = find_best_rider(
+            moto,
+            [sitting],
+            expand=0.45,
+            min_score=0.65,
+            person_min_conf=0.25,
+        )
+        self.assertIsNotNone(rider)
+        self.assertGreaterEqual(detail["score"], 0.65)
+
+        track = TrackState(11, 0, 0.0)
+        for i in range(3):
+            update_rider_state(
+                track,
+                person=sitting,
+                assoc=detail,
+                frame_idx=i,
+                min_score=0.65,
+                min_frames=3,
+            )
+        self.assertEqual(track.rider_state, RIDER_CONFIRMED)
+        ok, reason = can_run_helmet_classifier(
+            track, min_score=0.65, person_min_conf=0.25, head_available=True
+        )
+        self.assertTrue(ok, reason)
+
+    def test_helmet_gate_blocks_no_rider(self):
+        from scripts.cctv.rider_association import can_run_helmet_classifier
+
+        track = TrackState(5, 0, 0.0)
+        ok, reason = can_run_helmet_classifier(
+            track, min_score=0.65, person_min_conf=0.25, head_available=True
+        )
+        self.assertFalse(ok)
+        self.assertIn("rider_state", reason)
+
+
 if __name__ == "__main__":
     unittest.main()

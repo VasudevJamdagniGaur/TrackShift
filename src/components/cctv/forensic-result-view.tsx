@@ -38,7 +38,19 @@ export type ForensicJob = {
     annotatedVideoPath?: string | null;
     processingSeconds?: number;
     processingFps?: number;
+    roadDamage?: {
+      roadEvents?: number;
+      potholes?: number;
+      cracks?: number;
+      surfaceDamage?: number;
+      byCategory?: Record<string, number>;
+      byClass?: Record<string, number>;
+    };
+    analysisBranches?: string[];
   };
+  roadEvents?: number;
+  roadPotholes?: number;
+  roadCracks?: number;
   metadata?: {
     fps?: number;
     durationSeconds?: number;
@@ -70,6 +82,23 @@ export type ForensicViolation = {
   }>;
 };
 
+export type RoadDamageEvent = {
+  roadEventId: string;
+  eventNumber?: number;
+  timestamp: number;
+  frameNumber?: number;
+  classId: number;
+  className: string;
+  category: string;
+  confidence: number;
+  severity?: string;
+  hitCount?: number;
+  status?: string;
+  cropPath?: string | null;
+  evidencePath?: string | null;
+  bbox?: number[];
+};
+
 type FilterKey = "ALL" | "CONFIRMED" | "NEEDS_REVIEW" | "REJECTED";
 type SortKey = "time_asc" | "time_desc" | "conf_desc" | "conf_asc";
 
@@ -99,10 +128,12 @@ function videoSrcForJob(job: ForensicJob) {
 export function ForensicResultView({
   job,
   violations: initialViolations,
+  roadEvents: initialRoadEvents = [],
   onViolationsChange,
 }: {
   job: ForensicJob;
   violations: ForensicViolation[];
+  roadEvents?: RoadDamageEvent[];
   onViolationsChange?: (next: ForensicViolation[]) => void;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -110,6 +141,11 @@ export function ForensicResultView({
   const lastScrolledId = useRef<string | null>(null);
 
   const [violations, setViolations] = useState(initialViolations);
+  const [roadEvents, setRoadEvents] = useState(initialRoadEvents);
+  const [panelTab, setPanelTab] = useState<"traffic" | "road">("traffic");
+  const [roadFilter, setRoadFilter] = useState<
+    "ALL" | "pothole" | "crack" | "surface_damage"
+  >("ALL");
   const [currentVideoTime, setCurrentVideoTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [playing, setPlaying] = useState(false);
@@ -117,6 +153,9 @@ export function ForensicResultView({
     null
   );
   const [activeViolationId, setActiveViolationId] = useState<string | null>(
+    null
+  );
+  const [activeRoadEventId, setActiveRoadEventId] = useState<string | null>(
     null
   );
   const [filter, setFilter] = useState<FilterKey>("ALL");
@@ -130,6 +169,10 @@ export function ForensicResultView({
   useEffect(() => {
     setViolations(initialViolations);
   }, [initialViolations]);
+
+  useEffect(() => {
+    setRoadEvents(initialRoadEvents);
+  }, [initialRoadEvents]);
 
   const counts = useMemo(() => {
     const confirmed = violations.filter(
@@ -190,6 +233,22 @@ export function ForensicResultView({
     [violations]
   );
 
+  const findNearestRoad = useCallback(
+    (t: number) => {
+      let best: RoadDamageEvent | null = null;
+      let bestDist = Infinity;
+      for (const e of roadEvents) {
+        const d = Math.abs(e.timestamp - t);
+        if (d <= ACTIVE_TICKET_WINDOW && d < bestDist) {
+          best = e;
+          bestDist = d;
+        }
+      }
+      return best;
+    },
+    [roadEvents]
+  );
+
   const syncFromTime = useCallback(
     (t: number) => {
       setCurrentVideoTime(t);
@@ -197,7 +256,9 @@ export function ForensicResultView({
       const nextId = nearest?.violationId ?? null;
       setActiveViolationId(nextId);
       setOverlayTrack(nearest);
-      if (nextId && nextId !== lastScrolledId.current) {
+      const roadNear = findNearestRoad(t);
+      setActiveRoadEventId(roadNear?.roadEventId ?? null);
+      if (nextId && nextId !== lastScrolledId.current && panelTab === "traffic") {
         lastScrolledId.current = nextId;
         const el = ticketRefs.current[nextId];
         el?.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -206,12 +267,13 @@ export function ForensicResultView({
         lastScrolledId.current = null;
       }
     },
-    [findNearestTicket]
+    [findNearestTicket, findNearestRoad, panelTab]
   );
 
   const seekToTicket = useCallback((v: ForensicViolation, play = true) => {
     const video = videoRef.current;
     if (!video) return;
+    setPanelTab("traffic");
     setSelectedViolationId(v.violationId);
     setActiveViolationId(v.violationId);
     video.currentTime = Math.max(0, v.timestamp);
@@ -220,25 +282,103 @@ export function ForensicResultView({
     }
   }, []);
 
+  const seekToRoad = useCallback((e: RoadDamageEvent, play = true) => {
+    const video = videoRef.current;
+    if (!video) return;
+    setPanelTab("road");
+    setActiveRoadEventId(e.roadEventId);
+    video.currentTime = Math.max(0, e.timestamp);
+    if (play) {
+      void video.play().catch(() => undefined);
+    }
+  }, []);
+
+  const filteredRoad = useMemo(() => {
+    let list = [...roadEvents];
+    if (roadFilter !== "ALL") {
+      list = list.filter((e) => e.category === roadFilter);
+    }
+    list.sort((a, b) => a.timestamp - b.timestamp);
+    return list;
+  }, [roadEvents, roadFilter]);
+
+  const roadCounts = useMemo(() => {
+    const rd = job.summary?.roadDamage;
+    return {
+      total: roadEvents.length || rd?.roadEvents || 0,
+      potholes:
+        roadEvents.filter((e) => e.category === "pothole").length ||
+        rd?.potholes ||
+        0,
+      cracks:
+        roadEvents.filter((e) => e.category === "crack").length || rd?.cracks || 0,
+      surface:
+        roadEvents.filter((e) => e.category === "surface_damage").length ||
+        rd?.surfaceDamage ||
+        0,
+    };
+  }, [roadEvents, job.summary?.roadDamage]);
+
+  const [reviewError, setReviewError] = useState<string | null>(null);
+  const [reviewingId, setReviewingId] = useState<string | null>(null);
+
   const patchStatus = useCallback(
     async (v: ForensicViolation, status: "CONFIRMED" | "REJECTED" | "NEEDS_REVIEW") => {
-      const res = await fetch(`/api/cctv/violations/${v.violationId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ status }),
-      });
-      if (!res.ok) return;
-      const updated = (await res.json()) as ForensicViolation;
+      if (!v.violationId) {
+        setReviewError("Missing violation id — cannot update ticket.");
+        return;
+      }
+      setReviewError(null);
+      setReviewingId(v.violationId);
+      // Optimistic UI so review feels instant while watching
+      const previous = v.status;
       setViolations((prev) => {
         const next = prev.map((x) =>
-          x.violationId === updated.violationId ? { ...x, ...updated } : x
+          x.violationId === v.violationId ? { ...x, status } : x
         );
         onViolationsChange?.(next);
         return next;
       });
+      try {
+        const res = await fetch(`/api/cctv/violations/${encodeURIComponent(v.violationId)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ status }),
+        });
+        const updated = (await res.json()) as ForensicViolation & { error?: string };
+        if (!res.ok) {
+          throw new Error(updated.error || `Update failed (${res.status})`);
+        }
+        setViolations((prev) => {
+          const next = prev.map((x) =>
+            x.violationId === updated.violationId ? { ...x, ...updated } : x
+          );
+          onViolationsChange?.(next);
+          return next;
+        });
+      } catch (err) {
+        // Roll back optimistic change
+        setViolations((prev) => {
+          const next = prev.map((x) =>
+            x.violationId === v.violationId ? { ...x, status: previous } : x
+          );
+          onViolationsChange?.(next);
+          return next;
+        });
+        setReviewError(
+          err instanceof Error ? err.message : "Could not update ticket status"
+        );
+      } finally {
+        setReviewingId(null);
+      }
     },
     [onViolationsChange]
   );
+
+  const activeTicket =
+    violations.find((v) => v.violationId === activeViolationId) ||
+    violations.find((v) => v.violationId === selectedViolationId) ||
+    null;
 
   const evidence = evidenceId
     ? violations.find((v) => v.violationId === evidenceId)
@@ -261,7 +401,7 @@ export function ForensicResultView({
           </h3>
           <p className="mt-1 text-sm text-muted">
             Red = confirmed no helmet · Orange = potential · Green = helmet ·
-            Tickets sync with playback
+            Cyan/purple = road damage · Tickets sync with playback
           </p>
         </div>
         <div className="flex flex-wrap gap-2 text-sm">
@@ -274,9 +414,34 @@ export function ForensicResultView({
           <span className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-amber-900">
             {counts.needsReview} Needs review
           </span>
+          <span className="rounded-full border border-stone-200 bg-stone-50 px-3 py-1 text-stone-800">
+            {counts.rejected} Rejected
+          </span>
           <span className="rounded-full border border-[var(--border)] bg-cream px-3 py-1">
             {counts.platesIdentified} Plates · {counts.platesNotRead} unread
           </span>
+          <span className="rounded-full border border-sky-200 bg-sky-50 px-3 py-1 text-sky-900">
+            {roadCounts.total} Road events
+          </span>
+          <span className="rounded-full border border-violet-200 bg-violet-50 px-3 py-1 text-violet-900">
+            {roadCounts.potholes} Potholes
+          </span>
+          <Button asChild size="sm" variant="soft">
+            <a href={`/api/cctv/export?format=csv&videoId=${job.videoId}`}>
+              <Download className="h-4 w-4" />
+              Export CSV
+            </a>
+          </Button>
+          <Button asChild size="sm" variant="ghost">
+            <a href={`/api/cctv/export?format=json&videoId=${job.videoId}`}>
+              Export JSON
+            </a>
+          </Button>
+          <Button asChild size="sm" variant="ghost">
+            <a href={src} target="_blank" rel="noreferrer">
+              Open video
+            </a>
+          </Button>
         </div>
       </div>
 
@@ -336,14 +501,24 @@ export function ForensicResultView({
                     <div className="font-mono">{overlayTrack.plateText}</div>
                   ) : null}
                 </div>
+              ) : activeRoadEventId ? (
+                <div className="text-right text-sky-200">
+                  {roadEvents.find((e) => e.roadEventId === activeRoadEventId)
+                    ?.className || "Road damage"}
+                </div>
               ) : (
-                <div className="text-white/70">No active violation</div>
+                <div className="text-white/70">No active event</div>
               )}
             </div>
 
             {activeViolationId && (
               <div className="pointer-events-none absolute bottom-14 left-3 rounded-md border border-red-400/60 bg-red-950/70 px-2.5 py-1 text-[11px] font-semibold tracking-wide text-red-100">
                 NO HELMET DETECTED
+              </div>
+            )}
+            {!activeViolationId && activeRoadEventId && (
+              <div className="pointer-events-none absolute bottom-14 left-3 rounded-md border border-sky-400/60 bg-sky-950/70 px-2.5 py-1 text-[11px] font-semibold tracking-wide text-sky-100">
+                ROAD DAMAGE
               </div>
             )}
           </div>
@@ -390,12 +565,93 @@ export function ForensicResultView({
               Native HTML5 controls · seek / volume / fullscreen supported
             </div>
           </div>
+
+          {activeTicket && (
+            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[var(--border)] bg-cream px-3 py-2.5">
+              <div className="min-w-0 text-sm">
+                <div className="font-medium">
+                  Ticket #{String(activeTicket.ticketNumber ?? 0).padStart(3, "0")}{" "}
+                  <span className="text-muted">
+                    · {formatTs(activeTicket.timestamp)} ·{" "}
+                    {statusLabel(activeTicket.status)}
+                  </span>
+                </div>
+                <div className="truncate text-xs text-muted">
+                  {activeTicket.plateText || "PLATE NOT READ"} · NO HELMET{" "}
+                  {Math.round((activeTicket.noHelmetConfidence || 0) * 100)}%
+                </div>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="soft"
+                  disabled={reviewingId === activeTicket.violationId}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    void patchStatus(activeTicket, "CONFIRMED");
+                  }}
+                >
+                  <Check className="h-3.5 w-3.5" />
+                  Approve
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="danger"
+                  disabled={reviewingId === activeTicket.violationId}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    void patchStatus(activeTicket, "REJECTED");
+                  }}
+                >
+                  <X className="h-3.5 w-3.5" />
+                  Reject
+                </Button>
+              </div>
+            </div>
+          )}
+          {reviewError && (
+            <div className="border-t border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">
+              {reviewError}
+            </div>
+          )}
         </div>
 
         {/* Ticket panel */}
-        <div className="flex max-h-[min(78vh,820px)] flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-cream shadow-[var(--shadow-soft)]">
+        <div className="relative z-10 flex max-h-[min(78vh,820px)] flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-cream shadow-[var(--shadow-soft)]">
           <div className="border-b border-[var(--border)] px-4 py-3">
-            <div className="font-serif text-xl">Violations</div>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setPanelTab("traffic")}
+                className={cn(
+                  "rounded-full border px-3 py-1 text-xs font-semibold",
+                  panelTab === "traffic"
+                    ? "border-forest bg-forest text-cream"
+                    : "border-[var(--border)] bg-beige-soft/50 text-muted"
+                )}
+              >
+                Traffic ({counts.total})
+              </button>
+              <button
+                type="button"
+                onClick={() => setPanelTab("road")}
+                className={cn(
+                  "rounded-full border px-3 py-1 text-xs font-semibold",
+                  panelTab === "road"
+                    ? "border-forest bg-forest text-cream"
+                    : "border-[var(--border)] bg-beige-soft/50 text-muted"
+                )}
+              >
+                Road damage ({roadCounts.total})
+              </button>
+            </div>
+            {panelTab === "traffic" ? (
+              <>
+            <div className="mt-2 font-serif text-xl">Violations</div>
             <div className="mt-2 flex flex-wrap gap-2">
               {(
                 [
@@ -433,9 +689,121 @@ export function ForensicResultView({
                 <option value="conf_asc">Confidence lowest</option>
               </select>
             </label>
+              </>
+            ) : (
+              <>
+                <div className="mt-2 font-serif text-xl">Road damage</div>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {(
+                    [
+                      ["ALL", "All"],
+                      ["pothole", "Potholes"],
+                      ["crack", "Cracks"],
+                      ["surface_damage", "Alligator"],
+                    ] as const
+                  ).map(([key, label]) => (
+                    <button
+                      key={key}
+                      type="button"
+                      onClick={() => setRoadFilter(key)}
+                      className={cn(
+                        "rounded-full border px-2.5 py-1 text-[11px] font-medium",
+                        roadFilter === key
+                          ? "border-forest bg-forest text-cream"
+                          : "border-[var(--border)] bg-beige-soft/50 text-muted hover:border-forest/40"
+                      )}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <p className="mt-2 text-[11px] text-muted">
+                  Detected with YOLO26s RDD on the same video decode as traffic.
+                </p>
+              </>
+            )}
           </div>
 
           <div className="flex-1 space-y-3 overflow-y-auto p-3">
+            {panelTab === "road" ? (
+              <>
+                {filteredRoad.length === 0 && (
+                  <div className="rounded-xl border border-dashed border-[var(--border)] px-4 py-8 text-center text-sm text-muted">
+                    No road-damage events for this filter.
+                  </div>
+                )}
+                {filteredRoad.map((e) => {
+                  const active = e.roadEventId === activeRoadEventId;
+                  return (
+                    <div
+                      key={e.roadEventId}
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => seekToRoad(e)}
+                      onKeyDown={(ev) => {
+                        if (ev.key === "Enter" || ev.key === " ") {
+                          ev.preventDefault();
+                          seekToRoad(e);
+                        }
+                      }}
+                      className={cn(
+                        "cursor-pointer rounded-xl border bg-white/70 p-3 text-left transition",
+                        active
+                          ? "border-sky-400 shadow-[0_0_0_1px_rgba(56,160,200,0.35)] ring-1 ring-sky-300/50"
+                          : "border-[var(--border)] hover:border-forest/35"
+                      )}
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div>
+                          <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted">
+                            Road damage
+                          </div>
+                          <div className="font-serif text-lg">
+                            #{String(e.eventNumber ?? 0).padStart(3, "0")}
+                          </div>
+                        </div>
+                        <span className="rounded-full bg-sky-50 px-2 py-0.5 text-[10px] font-semibold uppercase text-sky-900">
+                          {e.category.replace("_", " ")}
+                        </span>
+                      </div>
+                      <dl className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1.5 text-xs">
+                        <div>
+                          <dt className="text-muted">Time</dt>
+                          <dd className="font-mono">{formatTs(e.timestamp)}</dd>
+                        </div>
+                        <div>
+                          <dt className="text-muted">Confidence</dt>
+                          <dd>{Math.round((e.confidence || 0) * 100)}%</dd>
+                        </div>
+                        <div className="col-span-2">
+                          <dt className="text-muted">Class</dt>
+                          <dd className="font-medium">{e.className}</dd>
+                        </div>
+                        <div>
+                          <dt className="text-muted">Severity</dt>
+                          <dd>{(e.severity || "—").toUpperCase()}</dd>
+                        </div>
+                        <div>
+                          <dt className="text-muted">Hits</dt>
+                          <dd>{e.hitCount ?? 1}</dd>
+                        </div>
+                      </dl>
+                      {(e.cropPath || e.evidencePath) && (
+                        <div className="mt-3 overflow-hidden rounded-lg border border-[var(--border)] bg-beige-soft/60">
+                          {/* eslint-disable-next-line @next/next/no-img-element */}
+                          <img
+                            src={e.cropPath || e.evidencePath || ""}
+                            alt=""
+                            className="max-h-36 w-full object-contain"
+                          />
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </>
+            ) : (
+              <>
             {filtered.length === 0 && (
               <div className="rounded-xl border border-dashed border-[var(--border)] px-4 py-8 text-center text-sm text-muted">
                 No tickets for this filter.
@@ -445,28 +813,25 @@ export function ForensicResultView({
               const active =
                 v.violationId === activeViolationId ||
                 v.violationId === selectedViolationId;
+              const busy = reviewingId === v.violationId;
               return (
                 <div
                   key={v.violationId}
                   ref={(el) => {
                     ticketRefs.current[v.violationId] = el;
                   }}
-                  role="button"
-                  tabIndex={0}
-                  onClick={() => seekToTicket(v)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === " ") {
-                      e.preventDefault();
-                      seekToTicket(v);
-                    }
-                  }}
                   className={cn(
-                    "cursor-pointer rounded-xl border bg-white/70 p-3 text-left transition",
+                    "rounded-xl border bg-white/70 p-3 text-left transition",
                     active
                       ? "border-red-400 shadow-[0_0_0_1px_rgba(220,80,60,0.35)] ring-1 ring-red-300/50"
                       : "border-[var(--border)] hover:border-forest/35"
                   )}
                 >
+                  <button
+                    type="button"
+                    className="w-full cursor-pointer text-left"
+                    onClick={() => seekToTicket(v)}
+                  >
                   <div className="flex items-start justify-between gap-2">
                     <div>
                       <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted">
@@ -512,6 +877,7 @@ export function ForensicResultView({
                       </dd>
                     </div>
                   </dl>
+                  </button>
 
                   <div className="mt-3 grid grid-cols-2 gap-2">
                     <div>
@@ -567,34 +933,44 @@ export function ForensicResultView({
                     </div>
                   </div>
 
-                  <div
-                    className="mt-3 flex flex-wrap gap-1.5"
-                    onClick={(e) => e.stopPropagation()}
-                    onKeyDown={(e) => e.stopPropagation()}
-                  >
+                  <div className="mt-3 flex flex-wrap gap-1.5">
                     <Button
                       type="button"
                       size="sm"
                       variant="soft"
-                      onClick={() => void patchStatus(v, "CONFIRMED")}
+                      disabled={busy || statusLabel(v.status) === "CONFIRMED"}
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        void patchStatus(v, "CONFIRMED");
+                      }}
                     >
                       <Check className="h-3.5 w-3.5" />
-                      Approve
+                      {statusLabel(v.status) === "CONFIRMED" ? "Approved" : "Approve"}
                     </Button>
                     <Button
                       type="button"
                       size="sm"
-                      variant="ghost"
-                      onClick={() => void patchStatus(v, "REJECTED")}
+                      variant={statusLabel(v.status) === "REJECTED" ? "ghost" : "danger"}
+                      disabled={busy || statusLabel(v.status) === "REJECTED"}
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        void patchStatus(v, "REJECTED");
+                      }}
                     >
                       <X className="h-3.5 w-3.5" />
-                      Reject
+                      {statusLabel(v.status) === "REJECTED" ? "Rejected" : "Reject"}
                     </Button>
                     <Button
                       type="button"
                       size="sm"
                       variant="ghost"
-                      onClick={() => setEvidenceId(v.violationId)}
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setEvidenceId(v.violationId);
+                      }}
                     >
                       <Eye className="h-3.5 w-3.5" />
                       View evidence
@@ -603,27 +979,10 @@ export function ForensicResultView({
                 </div>
               );
             })}
+              </>
+            )}
           </div>
         </div>
-      </div>
-
-      <div className="flex flex-wrap gap-2">
-        <Button asChild size="sm" variant="soft">
-          <a href={`/api/cctv/export?format=csv&videoId=${job.videoId}`}>
-            <Download className="h-4 w-4" />
-            Export CSV
-          </a>
-        </Button>
-        <Button asChild size="sm" variant="ghost">
-          <a href={`/api/cctv/export?format=json&videoId=${job.videoId}`}>
-            Export JSON
-          </a>
-        </Button>
-        <Button asChild size="sm" variant="ghost">
-          <a href={src} target="_blank" rel="noreferrer">
-            Open video stream
-          </a>
-        </Button>
       </div>
 
       {evidence && (

@@ -191,6 +191,7 @@ class ModelManager:
         self._pose: YOLO | None = None
         self._plate: YOLO | None = None
         self._ocr: PlateOCR | None = None
+        self._road: YOLO | None = None
 
     def load_motorcycle_detector(self) -> YOLO:
         if self._motorcycle is None:
@@ -221,6 +222,12 @@ class ModelManager:
             self._ocr = PlateOCR(self.config.ocr_dir, self.torch_dev, use_half=self.use_half)
         return self._ocr
 
+    def load_road_damage(self) -> YOLO:
+        if self._road is None:
+            path = _require_file(self.config.road_weights, "road-damage detector")
+            self._road = YOLO(str(path))
+        return self._road
+
     def yolo_kwargs(self) -> dict[str, Any]:
         return {
             "device": self.device,
@@ -228,7 +235,7 @@ class ModelManager:
             "verbose": False,
         }
 
-    def load_all(self, require_ocr: bool = False) -> dict[str, Any]:
+    def load_all(self, require_ocr: bool = False, require_road: bool = False) -> dict[str, Any]:
         loaded = {
             "device": self.device,
             "useHalf": self.use_half,
@@ -246,4 +253,13 @@ class ModelManager:
                 f"OCR weights missing at '{self.config.ocr_dir}'. "
                 "Download trocr_indian_plates_v3/final from vivekvar/helmet-v5."
             )
+        if self.config.enable_road_damage or require_road:
+            try:
+                loaded["road"] = self.load_road_damage()
+            except ModelLoadError:
+                if require_road:
+                    raise
+                loaded["road"] = None
+        else:
+            loaded["road"] = None
         return loaded

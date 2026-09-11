@@ -49,13 +49,20 @@ class CctvStore:
         self.jobs_dir = self.root / "jobs"
         self.videos_dir = self.root / "videos"
         self.violations_dir = self.root / "violations"
+        self.road_events_dir = self.root / "road_events"
         self.index_path = self.root / "index.json"
-        for d in (self.jobs_dir, self.videos_dir, self.violations_dir):
+        for d in (self.jobs_dir, self.videos_dir, self.violations_dir, self.road_events_dir):
             d.mkdir(parents=True, exist_ok=True)
         if not self.index_path.exists():
             _atomic_write(
                 self.index_path,
-                {"videos": [], "jobs": [], "violations": [], "updatedAt": _now()},
+                {
+                    "videos": [],
+                    "jobs": [],
+                    "violations": [],
+                    "roadEvents": [],
+                    "updatedAt": _now(),
+                },
             )
 
     def job_path(self, job_id: str) -> Path:
@@ -66,6 +73,9 @@ class CctvStore:
 
     def violation_path(self, violation_id: str) -> Path:
         return self.violations_dir / f"{violation_id}.json"
+
+    def road_event_path(self, event_id: str) -> Path:
+        return self.road_events_dir / f"{event_id}.json"
 
     def save_job(self, job: dict) -> dict:
         job = {**job, "updatedAt": _now()}
@@ -98,6 +108,26 @@ class CctvStore:
 
     def get_violation(self, violation_id: str) -> dict | None:
         return _read(self.violation_path(violation_id))
+
+    def save_road_event(self, event: dict) -> dict:
+        event = {**event, "updatedAt": _now()}
+        _atomic_write(self.road_event_path(event["roadEventId"]), event)
+        self._touch_index("roadEvents", event["roadEventId"])
+        return event
+
+    def list_road_events(self, video_id: str | None = None, job_id: str | None = None) -> list[dict]:
+        items = []
+        for path in sorted(self.road_events_dir.glob("*.json"), reverse=True):
+            data = _read(path)
+            if not data:
+                continue
+            if video_id and data.get("videoId") != video_id:
+                continue
+            if job_id and data.get("jobId") != job_id:
+                continue
+            items.append(data)
+        items.sort(key=lambda e: float(e.get("timestamp") or 0))
+        return items
 
     def list_violations(self, video_id: str | None = None) -> list[dict]:
         items = []

@@ -132,8 +132,30 @@ class CctvConfig:
     enable_multi_crop: bool = field(
         default_factory=lambda: _env_bool("ENABLE_MULTI_CROP", True)
     )
+    # MOTO_PROXY invents a rider from the motorcycle bbox — causes empty-bike
+    # NO HELMET false positives. Off by default; never bypasses rider gate.
     enable_moto_proxy_rider: bool = field(
-        default_factory=lambda: _env_bool("ENABLE_MOTO_PROXY_RIDER", True)
+        default_factory=lambda: _env_bool("ENABLE_MOTO_PROXY_RIDER", False)
+    )
+    # Strict rider association (primary gate before helmet/pose/OCR)
+    min_rider_association_score: float = field(
+        default_factory=lambda: _env_float("MIN_RIDER_ASSOCIATION_SCORE", 0.65)
+    )
+    rider_roi_expansion: float = field(
+        default_factory=lambda: _env_float("RIDER_ROI_EXPANSION", 0.45)
+    )
+    min_rider_track_frames: int = field(
+        default_factory=lambda: _env_int("MIN_RIDER_TRACK_FRAMES", 3)
+    )
+    person_min_confidence: float = field(
+        default_factory=lambda: _env_float("PERSON_MIN_CONFIDENCE", 0.25)
+    )
+    rider_lost_grace_frames: int = field(
+        default_factory=lambda: _env_int("RIDER_LOST_GRACE_FRAMES", 8)
+    )
+    # Allow person-bbox fallback head crop ONLY after RIDER_CONFIRMED (never from moto)
+    allow_fallback_head_after_rider: bool = field(
+        default_factory=lambda: _env_bool("ALLOW_FALLBACK_HEAD_AFTER_RIDER", True)
     )
     enable_plate_ocr: bool = field(
         default_factory=lambda: _env_bool("ENABLE_PLATE_OCR", True)
@@ -201,6 +223,22 @@ class CctvConfig:
         )
     )
 
+    # Dual-branch: traffic + road damage on the same decoded frames
+    enable_road_damage: bool = field(
+        default_factory=lambda: _env_bool("ENABLE_ROAD_DAMAGE", True)
+    )
+    road_weights: Path = field(
+        default_factory=lambda: Path(
+            os.getenv(
+                "CCTV_ROAD_WEIGHTS",
+                str(ROOT / "models" / "YOLO26s_RDD_FRDC_Distilled_v2.pt"),
+            )
+        )
+    )
+    road_conf: float = field(default_factory=lambda: _env_float("CCTV_ROAD_CONF", 0.20))
+    road_imgsz: int = field(default_factory=lambda: _env_int("CCTV_ROAD_IMGSZ", 640))
+    road_interval: int = field(default_factory=lambda: _env_int("ROAD_DETECTION_INTERVAL", 5))
+
     def __post_init__(self) -> None:
         self.apply_mode_defaults()
 
@@ -239,8 +277,13 @@ class CctvConfig:
             self.enable_helmet_enhance_rescue = True
         if os.getenv("ENABLE_MULTI_CROP") is None:
             self.enable_multi_crop = True
+        # Keep moto-proxy OFF unless explicitly enabled — empty bikes ≠ riders
         if os.getenv("ENABLE_MOTO_PROXY_RIDER") is None:
-            self.enable_moto_proxy_rider = True
+            self.enable_moto_proxy_rider = False
+        if os.getenv("MIN_RIDER_ASSOCIATION_SCORE") is None:
+            self.min_rider_association_score = 0.65
+        if os.getenv("MIN_RIDER_TRACK_FRAMES") is None:
+            self.min_rider_track_frames = 3
 
 
 CONFIG = CctvConfig()
