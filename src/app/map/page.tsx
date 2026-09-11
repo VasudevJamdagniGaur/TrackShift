@@ -14,6 +14,7 @@ import {
   platformStats,
   roadSegments,
 } from "@/data/mock";
+import { yoloDetectionsMeta } from "@/data/yolo-issues";
 import type { IssueType, Severity } from "@/types";
 
 export default function MapPage() {
@@ -62,8 +63,9 @@ export default function MapPage() {
           <div className="overflow-hidden rounded-[1.25rem] border border-[var(--border)] bg-cream shadow-[var(--shadow-soft)]">
             <div className="flex items-center justify-between border-b border-[var(--border)] px-4 py-3 text-sm">
               <span className="text-muted">
-                Showing {issues.length} issues · Demo markers
-                {showMapillary ? " · Mapillary check on" : ""}
+                Showing {issues.length} issues · {yoloDetectionsMeta.totalDetections}{" "}
+                YOLO-classified
+                {showMapillary ? " · Mapillary on" : ""}
               </span>
               <div className="hidden items-center gap-3 text-xs text-muted sm:flex">
                 <span>🔴 Severe</span>

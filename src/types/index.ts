@@ -34,6 +34,10 @@ export interface RoadIssue {
   occurrenceCount: number;
   description?: string;
   roadSegmentId: string;
+  /** Mapillary frame used as YOLO evidence, when available */
+  mapillaryImageId?: string;
+  /** Raw model class label from YOLO26s RDD */
+  modelClass?: string;
 }
 
 export interface SeverityHistoryEntry {

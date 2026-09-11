@@ -12,6 +12,7 @@ import type {
   RoadIssue,
   RoadSegment,
 } from "@/types";
+import { yoloIssues } from "@/data/yolo-issues";
 import { rankRepairPriorities } from "@/lib/scoring";
 
 const hoursAgo = (h: number) =>
@@ -857,8 +858,11 @@ export const sampleReport: ReportDraft = {
 
 export const repairPriorities = rankRepairPriorities(roadSegments, roadIssues);
 
+/** Demo issues plus YOLO-classified Mapillary detections (with evidence images). */
+export const allRoadIssues: RoadIssue[] = [...yoloIssues, ...roadIssues];
+
 export function getIssueById(id: string): RoadIssue | undefined {
-  return roadIssues.find((issue) => issue.id === id);
+  return allRoadIssues.find((issue) => issue.id === id);
 }
 
 export function getIssueHistory(id: string): IssueHistory | undefined {
@@ -872,7 +876,7 @@ export function filterIssues(params: {
   city?: string;
 }): RoadIssue[] {
   const q = params.query?.toLowerCase().trim() ?? "";
-  return roadIssues.filter((issue) => {
+  return allRoadIssues.filter((issue) => {
     const matchesQuery =
       !q ||
       issue.roadName.toLowerCase().includes(q) ||

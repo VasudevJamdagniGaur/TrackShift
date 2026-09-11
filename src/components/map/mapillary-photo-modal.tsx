@@ -41,6 +41,13 @@ export function MapillaryPhotoModal({
   const [loading, setLoading] = useState(false);
   const [sequenceLoading, setSequenceLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [classifyState, setClassifyState] = useState<{
+    loading: boolean;
+    error: string | null;
+    categories: string[];
+    detectionCount: number;
+    evidenceImage: string | null;
+  } | null>(null);
 
   useEffect(() => {
     if (open && imageId) {
@@ -54,6 +61,7 @@ export function MapillaryPhotoModal({
       setSequenceIds([]);
       setPoints([]);
       setError(null);
+      setClassifyState(null);
     }
   }, [open, imageId]);
 
@@ -178,6 +186,61 @@ export function MapillaryPhotoModal({
     }
   }, [index, sequenceIds]);
 
+  useEffect(() => {
+    setClassifyState(null);
+  }, [currentId]);
+
+  const runClassify = useCallback(async () => {
+    if (!data?.imageUrl || !data.id) return;
+    setClassifyState({
+      loading: true,
+      error: null,
+      categories: [],
+      detectionCount: 0,
+      evidenceImage: null,
+    });
+    try {
+      const res = await fetch("/api/detect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mapillaryImageId: data.id,
+          imageUrl: data.imageUrl,
+          latitude: data.latitude,
+          longitude: data.longitude,
+          roadName,
+        }),
+      });
+      const json = await res.json();
+      if (!res.ok) {
+        throw new Error(json.error || "Classification failed");
+      }
+      const firstEvidence =
+        (json.detections as { evidenceImage?: string }[] | undefined)?.[0]
+          ?.evidenceImage ?? null;
+      setClassifyState({
+        loading: false,
+        error: null,
+        categories: (json.categories as string[]) ?? [],
+        detectionCount: Number(json.detectionCount ?? 0),
+        evidenceImage: firstEvidence,
+      });
+    } catch (err) {
+      setClassifyState({
+        loading: false,
+        error: err instanceof Error ? err.message : "Classification failed",
+        categories: [],
+        detectionCount: 0,
+        evidenceImage: null,
+      });
+    }
+  }, [data, roadName]);
+
+  const displayImage =
+    classifyState?.evidenceImage && classifyState.detectionCount > 0
+      ? classifyState.evidenceImage
+      : data?.imageUrl;
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="w-[min(1100px,96vw)] overflow-hidden p-0">
@@ -208,11 +271,11 @@ export function MapillaryPhotoModal({
                   </Button>
                 </div>
               )}
-              {data && (
+              {data && displayImage && (
                 <>
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
-                    src={data.imageUrl}
+                    src={displayImage}
                     alt={`Mapillary street photo ${data.id}`}
                     className="max-h-[min(58vh,560px)] w-full object-contain"
                   />
@@ -266,6 +329,46 @@ export function MapillaryPhotoModal({
                 camera position and heading. Next moves to the immediate next
                 capture along the road.
               </p>
+              <div className="rounded-xl border border-white/10 bg-black/30 p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-xs font-semibold text-cream/90">
+                    YOLO26s road damage
+                  </div>
+                  <Button
+                    type="button"
+                    variant="soft"
+                    size="sm"
+                    disabled={!data || classifyState?.loading}
+                    onClick={runClassify}
+                  >
+                    {classifyState?.loading ? "Classifying…" : "Classify frame"}
+                  </Button>
+                </div>
+                {classifyState?.error && (
+                  <p className="mt-2 text-xs text-red-300">{classifyState.error}</p>
+                )}
+                {classifyState && !classifyState.loading && !classifyState.error && (
+                  <p className="mt-2 text-xs text-cream/75">
+                    {classifyState.detectionCount === 0
+                      ? "No damage detected in this frame (Potholes / Cracks / Surface Damage)."
+                      : `${classifyState.detectionCount} detection(s) → ${classifyState.categories
+                          .map((c) =>
+                            c === "surface_damage"
+                              ? "Surface Damage"
+                              : c === "pothole"
+                                ? "Potholes"
+                                : c === "crack"
+                                  ? "Cracks"
+                                  : c
+                          )
+                          .join(", ")}`}
+                  </p>
+                )}
+                <p className="mt-1 text-[10px] text-cream/45">
+                  Manhole & Road Markings are UI filters only — this model detects
+                  D00/D10/D20/D40 damage classes.
+                </p>
+              </div>
             </div>
           </div>
 

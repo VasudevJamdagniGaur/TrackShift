@@ -9,16 +9,25 @@ export type MapillaryCoverage = {
   mapillaryUrl?: string;
 };
 
+export type MapillaryStreetPoint = {
+  id: string;
+  latitude: number;
+  longitude: number;
+  compassAngle: number | null;
+};
+
 export function useMapillaryCoverage(issues: RoadIssue[], enabled = true) {
   const [coverage, setCoverage] = useState<Record<string, MapillaryCoverage>>(
     {}
   );
+  const [streetPoints, setStreetPoints] = useState<MapillaryStreetPoint[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!enabled || issues.length === 0) {
       setCoverage({});
+      setStreetPoints([]);
       return;
     }
 
@@ -48,6 +57,7 @@ export function useMapillaryCoverage(issues: RoadIssue[], enabled = true) {
             imageId?: string;
             mapillaryUrl?: string;
           }>;
+          streetPoints?: MapillaryStreetPoint[];
           error?: string;
         };
         if (!res.ok) {
@@ -63,6 +73,7 @@ export function useMapillaryCoverage(issues: RoadIssue[], enabled = true) {
           };
         }
         setCoverage(next);
+        setStreetPoints(data.streetPoints ?? []);
       } catch (err) {
         if (cancelled || (err as Error).name === "AbortError") return;
         setError((err as Error).message);
@@ -78,5 +89,5 @@ export function useMapillaryCoverage(issues: RoadIssue[], enabled = true) {
     };
   }, [issues, enabled]);
 
-  return { coverage, loading, error };
+  return { coverage, streetPoints, loading, error };
 }

@@ -6,6 +6,13 @@ type CoveragePoint = {
   longitude: number;
 };
 
+type StreetPhotoPoint = {
+  id: string;
+  latitude: number;
+  longitude: number;
+  compassAngle: number | null;
+};
+
 type CoverageResult = {
   id: string;
   available: boolean;
@@ -13,57 +20,119 @@ type CoverageResult = {
   mapillaryUrl?: string;
 };
 
-const DELTA = 0.0012; // ~130m — well under Mapillary's 0.01°² bbox limit
+const DELTA = 0.0015; // ~160m — under Mapillary's 0.01°² bbox limit
 
-async function checkPoint(
+async function fetchImagesInBbox(
   token: string,
-  point: CoveragePoint
-): Promise<CoverageResult> {
-  const west = point.longitude - DELTA;
-  const south = point.latitude - DELTA;
-  const east = point.longitude + DELTA;
-  const north = point.latitude + DELTA;
+  latitude: number,
+  longitude: number
+): Promise<StreetPhotoPoint[]> {
+  const west = longitude - DELTA;
+  const south = latitude - DELTA;
+  const east = longitude + DELTA;
+  const north = latitude + DELTA;
   const bbox = `${west},${south},${east},${north}`;
 
   const url = new URL("https://graph.mapillary.com/images");
-  url.searchParams.set("fields", "id");
+  url.searchParams.set(
+    "fields",
+    "id,computed_geometry,compass_angle"
+  );
   url.searchParams.set("bbox", bbox);
-  url.searchParams.set("limit", "1");
+  url.searchParams.set("limit", "50");
 
-  try {
-    const res = await fetch(url.toString(), {
-      headers: {
-        Authorization: `OAuth ${token}`,
-      },
+  const res = await fetch(url.toString(), {
+    headers: { Authorization: `OAuth ${token}` },
+    next: { revalidate: 1800 },
+  });
+  if (!res.ok) return [];
+
+  const data = (await res.json()) as {
+    data?: Array<{
+      id: string;
+      computed_geometry?: { coordinates?: [number, number] };
+      compass_angle?: number;
+    }>;
+  };
+
+  return (data.data ?? [])
+    .map((item) => {
+      const coords = item.computed_geometry?.coordinates;
+      if (!coords) return null;
+      return {
+        id: item.id,
+        longitude: coords[0],
+        latitude: coords[1],
+        compassAngle: item.compass_angle ?? null,
+      } satisfies StreetPhotoPoint;
+    })
+    .filter((p): p is StreetPhotoPoint => Boolean(p));
+}
+
+async function fetchSequencePoints(
+  token: string,
+  seedImageId: string
+): Promise<StreetPhotoPoint[]> {
+  const metaRes = await fetch(
+    `https://graph.mapillary.com/${seedImageId}?fields=id,sequence`,
+    {
+      headers: { Authorization: `OAuth ${token}` },
       next: { revalidate: 3600 },
-    });
-
-    if (!res.ok) {
-      return { id: point.id, available: false };
     }
+  );
+  if (!metaRes.ok) return [];
+  const meta = (await metaRes.json()) as { sequence?: string };
+  if (!meta.sequence) return [];
 
-    const data = (await res.json()) as { data?: Array<{ id: string }> };
-    const imageId = data.data?.[0]?.id;
-    if (!imageId) {
-      return { id: point.id, available: false };
+  const idsRes = await fetch(
+    `https://graph.mapillary.com/image_ids?sequence_id=${encodeURIComponent(meta.sequence)}`,
+    {
+      headers: { Authorization: `OAuth ${token}` },
+      next: { revalidate: 3600 },
     }
+  );
+  if (!idsRes.ok) return [];
+  const idsData = (await idsRes.json()) as { data?: Array<{ id: string }> };
+  const imageIds = (idsData.data ?? []).map((d) => d.id).slice(0, 120);
+  if (imageIds.length === 0) return [];
 
-    return {
-      id: point.id,
-      available: true,
-      imageId,
-      mapillaryUrl: `https://www.mapillary.com/app/?pKey=${imageId}&focus=photo`,
-    };
-  } catch {
-    return { id: point.id, available: false };
+  const points: StreetPhotoPoint[] = [];
+  for (let i = 0; i < imageIds.length; i += 40) {
+    const chunk = imageIds.slice(i, i + 40);
+    const batchRes = await fetch(
+      `https://graph.mapillary.com/?ids=${chunk.join(",")}&fields=id,computed_geometry,compass_angle`,
+      {
+        headers: { Authorization: `OAuth ${token}` },
+        next: { revalidate: 3600 },
+      }
+    );
+    if (!batchRes.ok) continue;
+    const batch = (await batchRes.json()) as Record<
+      string,
+      {
+        computed_geometry?: { coordinates?: [number, number] };
+        compass_angle?: number;
+      }
+    >;
+    for (const id of chunk) {
+      const coords = batch[id]?.computed_geometry?.coordinates;
+      if (!coords) continue;
+      points.push({
+        id,
+        longitude: coords[0],
+        latitude: coords[1],
+        compassAngle: batch[id]?.compass_angle ?? null,
+      });
+    }
   }
+  return points;
 }
 
 export async function POST(request: NextRequest) {
   const token = process.env.MAPILLARY_ACCESS_TOKEN;
   if (!token) {
     return NextResponse.json(
-      { error: "Mapillary token not configured", results: [] },
+      { error: "Mapillary token not configured", results: [], streetPoints: [] },
       { status: 500 }
     );
   }
@@ -72,23 +141,73 @@ export async function POST(request: NextRequest) {
   try {
     body = await request.json();
   } catch {
-    return NextResponse.json({ error: "Invalid JSON", results: [] }, { status: 400 });
+    return NextResponse.json(
+      { error: "Invalid JSON", results: [], streetPoints: [] },
+      { status: 400 }
+    );
   }
 
   const points = (body.points ?? []).slice(0, 40);
   if (points.length === 0) {
-    return NextResponse.json({ results: [] });
+    return NextResponse.json({ results: [], streetPoints: [] });
   }
 
-  // Sequential batches of 5 to stay gentle on rate limits
   const results: CoverageResult[] = [];
-  for (let i = 0; i < points.length; i += 5) {
-    const batch = points.slice(i, i + 5);
-    const batchResults = await Promise.all(
-      batch.map((point) => checkPoint(token, point))
+  const streetMap = new Map<string, StreetPhotoPoint>();
+  const sequenceSeeds: string[] = [];
+
+  for (let i = 0; i < points.length; i += 4) {
+    const batch = points.slice(i, i + 4);
+    const batchStreet = await Promise.all(
+      batch.map(async (point) => {
+        try {
+          const nearby = await fetchImagesInBbox(
+            token,
+            point.latitude,
+            point.longitude
+          );
+          const first = nearby[0];
+          results.push(
+            first
+              ? {
+                  id: point.id,
+                  available: true,
+                  imageId: first.id,
+                  mapillaryUrl: `https://www.mapillary.com/app/?pKey=${first.id}&focus=photo`,
+                }
+              : { id: point.id, available: false }
+          );
+          return { nearby, seed: first?.id };
+        } catch {
+          results.push({ id: point.id, available: false });
+          return { nearby: [] as StreetPhotoPoint[], seed: undefined };
+        }
+      })
     );
-    results.push(...batchResults);
+
+    for (const item of batchStreet) {
+      for (const photo of item.nearby) {
+        streetMap.set(photo.id, photo);
+      }
+      if (item.seed) sequenceSeeds.push(item.seed);
+    }
   }
 
-  return NextResponse.json({ results });
+  // Expand a few roads into full capture sequences (green dots along the street)
+  const uniqueSeeds = [...new Set(sequenceSeeds)].slice(0, 6);
+  for (const seed of uniqueSeeds) {
+    try {
+      const sequencePoints = await fetchSequencePoints(token, seed);
+      for (const photo of sequencePoints) {
+        streetMap.set(photo.id, photo);
+      }
+    } catch {
+      /* ignore sequence expansion failures */
+    }
+  }
+
+  return NextResponse.json({
+    results,
+    streetPoints: [...streetMap.values()],
+  });
 }

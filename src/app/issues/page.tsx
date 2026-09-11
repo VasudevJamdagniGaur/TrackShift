@@ -31,6 +31,10 @@ export default function IssuesPage() {
         <h1 className="mt-1 font-serif text-3xl md:text-4xl">
           Detected Infrastructure Issues
         </h1>
+        <p className="mt-2 max-w-2xl text-sm text-muted">
+          Includes YOLO26s-classified Mapillary frames (Potholes, Cracks, Surface
+          Damage) with annotated evidence images.
+        </p>
       </div>
 
       <div className="mb-5 rounded-[1.25rem] border border-[var(--border)] bg-cream p-4">

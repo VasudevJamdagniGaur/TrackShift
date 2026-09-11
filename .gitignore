@@ -37,6 +37,23 @@ yarn-error.log*
 **/secrets/
 mapillary*.token
 
+# local YOLO batch artifacts
+scripts/.mapillary_batch_input.json
+
+# temporary uploaded videos for live demo
+/tmp/
+
+# generated helmet tickets
+/public/detections/tickets/
+
+# CCTV forensic data + evidence
+/data/cctv/
+/public/cctv/
+
+# helmet-v5 downloaded weights (large)
+/models/helmet-v5/
+/models/pose/
+
 # vercel
 .vercel
 

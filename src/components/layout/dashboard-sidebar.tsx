@@ -5,16 +5,16 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   Activity,
+  AlertTriangle,
   BarChart3,
   Bus,
-  FileText,
   Home,
   Info,
   LayoutDashboard,
   Map,
   MessageSquare,
+  MonitorPlay,
   Settings,
-  AlertTriangle,
   Users,
 } from "lucide-react";
 import { HorseMark } from "@/components/brand/logo";
@@ -37,6 +37,12 @@ const items: NavItem[] = [
   { href: "/issues", label: "Issues", icon: AlertTriangle, modes: ["citizen", "admin"] },
   { href: "/analytics", label: "Analytics", icon: BarChart3, modes: ["admin"] },
   { href: "/buses", label: "Bus Monitoring", icon: Bus, modes: ["admin"] },
+  {
+    href: "/live-demo",
+    label: "Live Demo",
+    icon: MonitorPlay,
+    modes: ["citizen", "admin"],
+  },
   { href: "/feedback", label: "Feedback", icon: MessageSquare, modes: ["admin"] },
   { href: "/settings", label: "Settings", icon: Settings, modes: ["admin"] },
   { href: "/about", label: "About", icon: Info, modes: ["citizen", "admin"] },

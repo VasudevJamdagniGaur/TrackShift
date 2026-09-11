@@ -1,0 +1,398 @@
+{
+  "generatedAt": "2026-09-10T11:55:27.094681Z",
+  "model": "YOLO26s_RDD_FRDC_Distilled_v2.pt",
+  "totalDetections": 6,
+  "byCategory": {
+    "pothole": 4,
+    "surface_damage": 1,
+    "crack": 1
+  },
+  "summary": [
+    {
+      "imageId": "3006308092870291",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "1234844321494071",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "706199148747415",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "600488816374603",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "672526212160192",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "1034472048826446",
+      "ok": true,
+      "detectionCount": 1,
+      "categories": [
+        "pothole"
+      ]
+    },
+    {
+      "imageId": "694344883149111",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "3465191383617865",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "2495680417450285",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "651552277749796",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "2536590930066442",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "1421049959252766",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "692770356470945",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "1034839314726831",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "1709625233240431",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "657593993701224",
+      "ok": true,
+      "detectionCount": 1,
+      "categories": [
+        "pothole"
+      ]
+    },
+    {
+      "imageId": "1352576486011968",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "1817262218844730",
+      "ok": true,
+      "detectionCount": 1,
+      "categories": [
+        "pothole"
+      ]
+    },
+    {
+      "imageId": "578264571374389",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "1354997419062977",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "1378841266771397",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "669154545976225",
+      "ok": true,
+      "detectionCount": 1,
+      "categories": [
+        "pothole"
+      ]
+    },
+    {
+      "imageId": "1146169363927789",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "695184253090446",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "606483209104444",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "1226950278959915",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "1602539663760304",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "1462836174886014",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "1657299494900125",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "597817636756757",
+      "ok": true,
+      "detectionCount": 1,
+      "categories": [
+        "surface_damage"
+      ]
+    },
+    {
+      "imageId": "2471146549901299",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "4175326509367163",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "1313583563079075",
+      "ok": true,
+      "detectionCount": 1,
+      "categories": [
+        "crack"
+      ]
+    },
+    {
+      "imageId": "675082245385347",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "1780650733332918",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "558776886879862",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "2496457380696333",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "1400559364475440",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "994958892391696",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    },
+    {
+      "imageId": "1217114123424663",
+      "ok": true,
+      "detectionCount": 0,
+      "categories": []
+    }
+  ],
+  "detections": [
+    {
+      "id": "YOLO-1034472048826446-1",
+      "type": "pothole",
+      "modelClass": "Pothole (D40)",
+      "severity": "low",
+      "confidence": 0.357,
+      "latitude": 19.112099691315,
+      "longitude": 72.841594808775,
+      "roadName": "S.V. Road",
+      "city": "Mumbai",
+      "area": "Mumbai",
+      "mapillaryImageId": "1034472048826446",
+      "evidenceImage": "/detections/yolo_1034472048826446.jpg",
+      "bbox": {
+        "x1": 243.7250518798828,
+        "y1": 1347.5771484375,
+        "x2": 341.387939453125,
+        "y2": 1402.4974365234375
+      },
+      "source": "yolo26s_rdd_mapillary",
+      "status": "new"
+    },
+    {
+      "id": "YOLO-657593993701224-1",
+      "type": "pothole",
+      "modelClass": "Pothole (D40)",
+      "severity": "low",
+      "confidence": 0.1818,
+      "latitude": 19.112413464603,
+      "longitude": 72.84168083123,
+      "roadName": "S.V. Road",
+      "city": "Mumbai",
+      "area": "Mumbai",
+      "mapillaryImageId": "657593993701224",
+      "evidenceImage": "/detections/yolo_657593993701224.jpg",
+      "bbox": {
+        "x1": 1284.763671875,
+        "y1": 1445.843505859375,
+        "x2": 1382.952880859375,
+        "y2": 1529.9346923828125
+      },
+      "source": "yolo26s_rdd_mapillary",
+      "status": "new"
+    },
+    {
+      "id": "YOLO-1817262218844730-1",
+      "type": "pothole",
+      "modelClass": "Pothole (D40)",
+      "severity": "low",
+      "confidence": 0.4017,
+      "latitude": 19.112485710879,
+      "longitude": 72.841705049458,
+      "roadName": "S.V. Road",
+      "city": "Mumbai",
+      "area": "Mumbai",
+      "mapillaryImageId": "1817262218844730",
+      "evidenceImage": "/detections/yolo_1817262218844730.jpg",
+      "bbox": {
+        "x1": 1638.0247802734375,
+        "y1": 1010.99169921875,
+        "x2": 1739.7568359375,
+        "y2": 1073.135498046875
+      },
+      "source": "yolo26s_rdd_mapillary",
+      "status": "new"
+    },
+    {
+      "id": "YOLO-669154545976225-1",
+      "type": "pothole",
+      "modelClass": "Pothole (D40)",
+      "severity": "low",
+      "confidence": 0.1831,
+      "latitude": 19.12491125268,
+      "longitude": 72.846853504498,
+      "roadName": "S.V. Road",
+      "city": "Mumbai",
+      "area": "Mumbai",
+      "mapillaryImageId": "669154545976225",
+      "evidenceImage": "/detections/yolo_669154545976225.jpg",
+      "bbox": {
+        "x1": 833.95947265625,
+        "y1": 1440.2935791015625,
+        "x2": 990.0037841796875,
+        "y2": 1528.0963134765625
+      },
+      "source": "yolo26s_rdd_mapillary",
+      "status": "new"
+    },
+    {
+      "id": "YOLO-597817636756757-1",
+      "type": "surface_damage",
+      "modelClass": "Alligator Crack (D20)",
+      "severity": "medium",
+      "confidence": 0.7016,
+      "latitude": 19.12466731545,
+      "longitude": 72.846814699888,
+      "roadName": "S.V. Road",
+      "city": "Mumbai",
+      "area": "Mumbai",
+      "mapillaryImageId": "597817636756757",
+      "evidenceImage": "/detections/yolo_597817636756757.jpg",
+      "bbox": {
+        "x1": 942.7042846679688,
+        "y1": 965.1351318359375,
+        "x2": 1505.8304443359375,
+        "y2": 1253.2906494140625
+      },
+      "source": "yolo26s_rdd_mapillary",
+      "status": "new"
+    },
+    {
+      "id": "YOLO-1313583563079075-1",
+      "type": "crack",
+      "modelClass": "Transverse Crack (D10)",
+      "severity": "low",
+      "confidence": 0.281,
+      "latitude": 19.124604535895,
+      "longitude": 72.846803366616,
+      "roadName": "S.V. Road",
+      "city": "Mumbai",
+      "area": "Mumbai",
+      "mapillaryImageId": "1313583563079075",
+      "evidenceImage": "/detections/yolo_1313583563079075.jpg",
+      "bbox": {
+        "x1": 201.5498504638672,
+        "y1": 1330.4710693359375,
+        "x2": 754.8628540039062,
+        "y2": 1459.987548828125
+      },
+      "source": "yolo26s_rdd_mapillary",
+      "status": "new"
+    }
+  ]
+}

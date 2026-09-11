@@ -63,6 +63,24 @@ function FitBounds({
   return null;
 }
 
+function nearestRoadName(
+  issues: RoadIssue[],
+  latitude: number,
+  longitude: number
+) {
+  let best = issues[0]?.roadName ?? "Street photo";
+  let bestDist = Number.POSITIVE_INFINITY;
+  for (const issue of issues) {
+    const d =
+      (issue.latitude - latitude) ** 2 + (issue.longitude - longitude) ** 2;
+    if (d < bestDist) {
+      bestDist = d;
+      best = issue.roadName;
+    }
+  }
+  return best;
+}
+
 export function RoadMap({
   issues,
   segments = [],
@@ -86,7 +104,10 @@ export function RoadMap({
     return MAP_CENTER;
   }, [focus, issues]);
 
-  const { coverage, loading, error } = useMapillaryCoverage(issues, showMapillary);
+  const { coverage, streetPoints, loading, error } = useMapillaryCoverage(
+    issues,
+    showMapillary
+  );
   const [viewer, setViewer] = useState<{
     imageId: string;
     roadName: string;
@@ -128,25 +149,62 @@ export function RoadMap({
               pathOptions={{ color: "#B8975A", weight: 3, opacity: 0.7 }}
             />
           ))}
+
+          {/* Exact Mapillary capture points along covered streets */}
           {showMapillary &&
-            issues.map((issue) => {
-              const status = coverage[issue.id];
-              if (!status) return null;
-              return (
-                <CircleMarker
-                  key={`mly-${issue.id}`}
-                  center={[issue.latitude, issue.longitude]}
-                  radius={status.available ? 16 : 12}
-                  pathOptions={{
-                    color: status.available ? "#059669" : "#9CA3AF",
-                    fillColor: status.available ? "#10B981" : "#D1D5DB",
-                    fillOpacity: status.available ? 0.18 : 0.12,
-                    weight: 1.5,
-                    opacity: 0.85,
-                  }}
-                />
-              );
-            })}
+            streetPoints.map((point) => (
+              <CircleMarker
+                key={`street-${point.id}`}
+                center={[point.latitude, point.longitude]}
+                radius={4}
+                pathOptions={{
+                  color: "#047857",
+                  fillColor: "#10B981",
+                  fillOpacity: 0.95,
+                  weight: 1,
+                  opacity: 0.95,
+                }}
+                eventHandlers={{
+                  click: () =>
+                    setViewer({
+                      imageId: point.id,
+                      roadName: nearestRoadName(
+                        issues,
+                        point.latitude,
+                        point.longitude
+                      ),
+                    }),
+                }}
+              >
+                <Popup>
+                  <div className="p-3 text-xs">
+                    <div className="font-semibold text-emerald-700">
+                      Mapillary photo available
+                    </div>
+                    <div className="mt-1 text-muted">
+                      {point.latitude.toFixed(5)}, {point.longitude.toFixed(5)}
+                    </div>
+                    <button
+                      type="button"
+                      className="mt-2 font-medium text-forest underline-offset-2 hover:underline"
+                      onClick={() =>
+                        setViewer({
+                          imageId: point.id,
+                          roadName: nearestRoadName(
+                            issues,
+                            point.latitude,
+                            point.longitude
+                          ),
+                        })
+                      }
+                    >
+                      Open exact photo →
+                    </button>
+                  </div>
+                </Popup>
+              </CircleMarker>
+            ))}
+
           {issues.map((issue) => {
             const status = showMapillary ? coverage[issue.id] : undefined;
             return (
@@ -157,15 +215,23 @@ export function RoadMap({
                 eventHandlers={{
                   click: () => onSelectIssue?.(issue),
                 }}
+                zIndexOffset={200}
               >
                 <Popup>
                   <div className="p-4">
                     <div className="mb-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-gold">
                       {issueTypeLabel(issue.type)}
+                      {issue.modelClass ? ` · ${issue.modelClass}` : ""}
                     </div>
                     <div className="font-serif text-lg text-charcoal">
                       {issue.roadName}
                     </div>
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={issue.evidenceImage}
+                      alt=""
+                      className="mt-3 h-28 w-full rounded-xl object-cover"
+                    />
                     <div className="mt-3 grid grid-cols-2 gap-3 text-xs">
                       <div>
                         <div className="text-muted">Severity</div>
@@ -191,16 +257,35 @@ export function RoadMap({
                       </div>
                     </div>
 
-                    {showMapillary && (
+                    {(issue.mapillaryImageId || showMapillary) && (
                       <div className="mt-3 rounded-xl border border-[var(--border)] bg-beige-soft/50 px-3 py-2 text-xs">
                         <div className="text-muted">Mapillary street photo</div>
-                        {status == null ? (
+                        {issue.mapillaryImageId ? (
+                          <div className="mt-1 flex flex-wrap items-center gap-2">
+                            <span className="inline-flex items-center gap-1.5 font-semibold text-emerald-700">
+                              <span className="h-2 w-2 rounded-full bg-emerald-500" />
+                              YOLO evidence frame
+                            </span>
+                            <button
+                              type="button"
+                              className="font-medium text-forest underline-offset-2 hover:underline"
+                              onClick={() =>
+                                setViewer({
+                                  imageId: issue.mapillaryImageId!,
+                                  roadName: issue.roadName,
+                                })
+                              }
+                            >
+                              Open photo →
+                            </button>
+                          </div>
+                        ) : status == null ? (
                           <div className="mt-1 font-medium text-charcoal">Checking…</div>
                         ) : status.available && status.imageId ? (
                           <div className="mt-1 flex flex-wrap items-center gap-2">
                             <span className="inline-flex items-center gap-1.5 font-semibold text-emerald-700">
                               <span className="h-2 w-2 rounded-full bg-emerald-500" />
-                              Available
+                              Available on this street
                             </span>
                             <button
                               type="button"
@@ -238,26 +323,27 @@ export function RoadMap({
         </MapContainer>
 
         {showMapillary && (
-          <div className="pointer-events-none absolute bottom-3 left-3 z-[500] max-w-[240px] rounded-2xl border border-[var(--border-strong)] bg-cream/95 px-3 py-2 text-[11px] shadow-[var(--shadow-soft)] backdrop-blur">
-            <div className="font-semibold text-charcoal">Mapillary coverage</div>
+          <div className="pointer-events-none absolute bottom-3 left-3 z-[500] max-w-[260px] rounded-2xl border border-[var(--border-strong)] bg-cream/95 px-3 py-2 text-[11px] shadow-[var(--shadow-soft)] backdrop-blur">
+            <div className="font-semibold text-charcoal">Mapillary street coverage</div>
             <div className="mt-1.5 flex items-center gap-2 text-muted">
               <span className="inline-flex items-center gap-1">
                 <span className="h-2.5 w-2.5 rounded-full bg-emerald-500" />
-                Available
+                Photo on street
               </span>
               <span className="inline-flex items-center gap-1">
                 <span className="h-2.5 w-2.5 rounded-full bg-stone-400" />
-                Not available
+                Issue, no photo
               </span>
             </div>
             <div className="mt-1 text-muted">
               {loading
-                ? "Checking street photography…"
+                ? "Loading street photography points…"
                 : error
                   ? "Coverage check failed"
-                  : checkedCount > 0
-                    ? `${availableCount}/${checkedCount} locations covered`
-                    : "No locations checked yet"}
+                  : `${streetPoints.length} photo points · ${availableCount}/${checkedCount} issue areas covered`}
+            </div>
+            <div className="mt-1 text-[10px] text-muted">
+              Click a green dot to open the exact Mapillary image at that location.
             </div>
           </div>
         )}
